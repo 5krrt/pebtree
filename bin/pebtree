@@ -44,7 +44,8 @@ const REPO_DIR = CONFIG.repoDir || (MAIN ? path.basename(MAIN) : ''); // the che
 const TEARDOWN = CONFIG.teardown !== undefined ? CONFIG.teardown : ((process.env.PATH || '').split(':').some((d) => d && fs.existsSync(path.join(d, 'treehouse-dev'))) ? 'treehouse-dev teardown {tree}' : '');
 const JOURNAL_SKILL = CONFIG.journalSkill || '/daily-standup';
 const LOCAL_HOST = CONFIG.localHost || 'mac'; // this Mac's id in session ids; others come from config.json "hosts"
-const CLAUDE_ARGS = Array.isArray(CONFIG.claudeArgs) ? CONFIG.claudeArgs.map(String) : ['--dangerously-skip-permissions']; // what sessions pebtree starts run with
+// what sessions pebtree starts run with; skipping permission prompts is something config.json opts into, never the default
+const CLAUDE_ARGS = Array.isArray(CONFIG.claudeArgs) ? CONFIG.claudeArgs.map(String) : [];
 const SWARM = path.join(HOME, '.claude/swarm');
 const SETTINGS_FILE = path.join(CONF_DIR, 'settings.json');
 const UI_FILE = path.join(CONF_DIR, 'ui.json'); // page layout prefs (splits, ranges, font...) so every browser and window gets the same layout
@@ -524,7 +525,9 @@ async function spawnSession(spec) {
   fs.mkdirSync(LAUNCH_DIR, { recursive: true });
   let prompt = '';
   if (String(spec.prompt || '').trim()) { const pf = path.join(LAUNCH_DIR, `${Date.now()}-${rand}.md`); fs.writeFileSync(pf, String(spec.prompt)); prompt = ` "$(cat ${shq(pf)})"`; }
-  const claude = ['claude', ...CLAUDE_ARGS, ...(spec.title ? ['-n', String(spec.title).slice(0, 50)] : [])].map(shq).join(' ') + prompt;
+  // a prompt written by someone else (a ticket) never runs with permission prompts switched off
+  const args = spec.untrusted ? CLAUDE_ARGS.filter((a) => !/^--dangerously-skip-permissions$|^--permission-mode(=bypassPermissions)?$|^bypassPermissions$/.test(a)) : CLAUDE_ARGS;
+  const claude = ['claude', ...args, ...(spec.title ? ['-n', String(spec.title).slice(0, 50)] : [])].map(shq).join(' ') + prompt;
   const shell = 'exec "${SHELL:-/bin/sh}" -l';
   const has = async (n) => (await runOk('tmux', ['has-session', '-t', `=${n}`], { timeout: 4000 })).ok;
   let cwd = at, name, lines, treePath = '', tree = '';
@@ -1762,7 +1765,7 @@ function spinoffTarget(from) {
   const c = CONFIG.spinoff || presets().find((p) => p.kind === 'tree');
   return c ? { host: c.host || LOCAL_HOST, repo: c.repo } : { host: LOCAL_HOST, repo: MAIN };
 }
-async function spinoff({ task, title, from, host, repo }) {
+async function spinoff({ task, title, from, host, repo, untrusted }) {
   task = String(task || '').trim();
   if (!task) return { ok: false, error: 'the task is empty' };
   title = String(title || task.split('\n')[0]).replace(/\s+/g, ' ').trim().slice(0, 50);
@@ -1780,7 +1783,7 @@ Then do the task below, following the repo's CLAUDE.md. Commit on your branch; a
 ## Task
 ${task}
 `;
-  const r = await h.call('spawn', { kind: 'tree', repo: tgt.repo, prompt: brief, title }, 600000);
+  const r = await h.call('spawn', { kind: 'tree', repo: tgt.repo, prompt: brief, title, untrusted: !!untrusted }, 600000);
   if (!r.ok) return r;
   const tree = `${h.id}:${path.basename(r.path)}:${r.tree}`;
   logAction({ op: 'spinoff', tree, label: title });
@@ -1916,7 +1919,7 @@ async function startTicket(id) {
   const t = TICKETS.get(id);
   if (!t) return { ok: false, error: 'no such ticket (wait for the next poll)' };
   if (tkStarted[id] && slow.trees.get(String(tkStarted[id].tree))) return { ok: false, error: `already started in tree ${tkStarted[id].tree}` };
-  const r = await spinoff({ task: ticketBrief(t), title: t.title.slice(0, 50) });
+  const r = await spinoff({ task: ticketBrief(t), title: t.title.slice(0, 50), untrusted: true });
   if (!r.ok) return r;
   tkStarted[id] = { tree: r.tree, at: Date.now() };
   try { fs.writeFileSync(TK_STATE_FILE, JSON.stringify(tkStarted, null, 2)); } catch { /* best effort */ }
