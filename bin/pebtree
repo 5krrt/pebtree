@@ -4423,7 +4423,8 @@ function fitTerm(t){try{t.fit.fit()}catch(e){}}
 function connectTerm(t){fitTerm(t);clearTimeout(t.rt);var exit=null;
   var ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/api/term?t='+TOKEN+'&host='+encodeURIComponent(t.host)+'&session='+encodeURIComponent(t.session)+'&cols='+t.term.cols+'&rows='+t.term.rows);
   ws.binaryType='arraybuffer';t.ws=ws;
-  ws.onopen=function(){t.alive=true;t.retry=0;paintTermTabs()};
+  // the size it was measured at may be from before the page laid out, and a resize sent while connecting is lost: send it now
+  ws.onopen=function(){t.alive=true;t.retry=0;paintTermTabs();fitTerm(t);ws.send(JSON.stringify({r:[t.term.cols,t.term.rows]}))};
   ws.onmessage=function(m){if(typeof m.data==='string'){try{var j=JSON.parse(m.data);if(j.exit!==undefined)exit=j.exit}catch(e){}return}t.term.write(new Uint8Array(m.data))};
   ws.onclose=function(){t.alive=false;t.ws=null;paintTermTabs();if(t.closed)return;
     var h=(S.hosts||[]).find(function(q){return q.id===t.host}),gone=h&&h.up&&!h.terms.some(function(q){return q.session===t.session});
