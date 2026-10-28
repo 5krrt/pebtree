@@ -2632,16 +2632,17 @@ const PAGE = String.raw`<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>pebtree</title>
 <link rel="icon" id="favicon" type="image/svg+xml" href="">
-<script>window.__UI=__UIPREFS__;</script><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Manrope:wght@400;500;600;700&family=Oswald:wght@500;600;700&display=swap">
-<script>var FONTS={system:{label:'System (SF Pro)',sans:'-apple-system,BlinkMacSystemFont,sans-serif',mono:'ui-monospace,"SF Mono",Menlo,monospace'},
+<script>window.__UI=__UIPREFS__;</script><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Manrope:wght@400;500;600;700&family=Oswald:wght@500;600;700&family=Roboto+Mono:wght@400;500&display=swap">
+<script>var FONTS={stacked:{label:'Inter + Roboto Mono',sans:'Inter,-apple-system,sans-serif',mono:'"Roboto Mono",ui-monospace,monospace'},
+system:{label:'System (SF Pro)',sans:'-apple-system,BlinkMacSystemFont,sans-serif',mono:'ui-monospace,"SF Mono",Menlo,monospace'},
 meslo:{label:'MesloLGS NF (your terminal)',sans:'"MesloLGS NF",Menlo,monospace',mono:'"MesloLGS NF",Menlo,monospace',size:'13px'},
 inter:{label:'Inter + Meslo numbers',sans:'Inter,-apple-system,sans-serif',mono:'"MesloLGS NF",Menlo,monospace'},
 geist:{label:'Geist + Geist Mono',sans:'Geist,-apple-system,sans-serif',mono:'"Geist Mono",ui-monospace,monospace'},
 plex:{label:'IBM Plex Sans + Mono',sans:'"IBM Plex Sans",-apple-system,sans-serif',mono:'"IBM Plex Mono",ui-monospace,monospace'},
 manrope:{label:'Manrope + JetBrains Mono',sans:'Manrope,-apple-system,sans-serif',mono:'"JetBrains Mono",ui-monospace,monospace'}};
 function applyFont(id){var f=FONTS[id]||FONTS.system,r=document.documentElement.style;r.setProperty('--sans',f.sans);r.setProperty('--mono',f.mono);r.setProperty('--fsize',f.size||'14px')}
-try{applyFont(window.__UI['treehouse-font']||localStorage.getItem('treehouse-font')||'system')}catch(e){}</script>
-<script>try{var t=window.__UI['devdeck-theme']||localStorage.getItem('devdeck-theme');if(t==='light'||t==='dark')document.documentElement.dataset.theme=t;var y=window.__UI['treehouse-style'];if(y==='flat'||y==='valorant')document.documentElement.dataset.style=y}catch(e){}</script>
+try{applyFont(window.__UI['treehouse-font']||localStorage.getItem('treehouse-font')||'stacked')}catch(e){}</script>
+<script>try{var t=window.__UI['devdeck-theme']||localStorage.getItem('devdeck-theme');if(t==='light'||t==='dark')document.documentElement.dataset.theme=t;var y=window.__UI['treehouse-style']||localStorage.getItem('treehouse-style')||'stacked';if(y==='flat'||y==='valorant'||y==='stacked')document.documentElement.dataset.style=y}catch(e){}</script>
 <style>
 :root{--bg:#E5E9F0;--panel:#F5F7FA;--sunk:#E5E9F0;--side:#D8DEE9;--ink:#2E3440;--muted:#4C566A;--faint:#7B88A1;--line:#D8DEE9;--grid:#E5E9F0;--work:#5E81AC;--wait:#C5714F;--ok:#6E8F57;--bad:#BF616A;--warn:#B48A2E;--accent:#5E81AC;--onaccent:#ECEFF4;--other:#B9C2D0;--shadow:0 0 0 1px rgba(46,52,64,.03),0 1px 2px rgba(46,52,64,.06),0 6px 16px -8px rgba(46,52,64,.16);--shadow-lg:0 2px 4px rgba(46,52,64,.06),0 18px 40px -18px rgba(46,52,64,.35);--hi:inset 0 1px 0 rgba(255,255,255,.7);--panel2:#EEF1F6;--wash1:rgba(136,192,208,.18);--wash2:rgba(180,142,173,.12);--mono:ui-monospace,"SF Mono",Menlo,monospace}
 @media (prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#2E3440;--panel:#3B4252;--sunk:#434C5E;--side:#272C36;--ink:#ECEFF4;--muted:#AEB7C6;--faint:#7B88A1;--line:#4C566A;--grid:#434C5E;--work:#88C0D0;--wait:#D08770;--ok:#A3BE8C;--bad:#BF616A;--warn:#EBCB8B;--accent:#88C0D0;--onaccent:#2E3440;--other:#616E88;--shadow:0 0 0 1px rgba(0,0,0,.12),0 1px 2px rgba(0,0,0,.22),0 8px 18px -8px rgba(0,0,0,.4);--shadow-lg:0 2px 4px rgba(0,0,0,.3),0 20px 44px -18px rgba(0,0,0,.65);--hi:inset 0 1px 0 rgba(255,255,255,.05);--panel2:#363D4B;--wash1:rgba(136,192,208,.10);--wash2:rgba(180,142,173,.08)}}
@@ -3103,6 +3104,77 @@ html[data-style=valorant] body :is(.ticon svg,.okdot,.offdot,.dots i,.spin,.tico
 [data-style=valorant] a{color:#FF7C87}
 [data-style=valorant] nav a{color:var(--muted)!important}[data-style=valorant] nav a:hover{color:var(--ink)!important}[data-style=valorant] nav a.on{color:#fff!important}
 [data-style=valorant] .post-head .tname{font-family:Oswald,var(--sans);text-transform:uppercase;letter-spacing:.05em;font-weight:600}
+/* Style: Stacked (the default). Taken from the dashboard on stacked.com: a near-black page, cards one step lighter
+   with hairline borders and no shadows, a grayscale ramp for type, white primary buttons, sentence-case labels,
+   and status shown as a small colored dot inside an outlined pill rather than a tinted fill. */
+html:root[data-style=stacked]{--bg:#0a0a0a;--panel:#111111;--panel2:#111111;--sunk:#1e1e1e;--side:#0a0a0a;--ink:#f5f5f5;--muted:#898989;--faint:#626262;--line:#262626;--grid:#1e1e1e;--work:#978DFF;--wait:#F5A623;--ok:#32C86E;--bad:#FF4259;--warn:#EAB308;--accent:#f5f5f5;--onaccent:#0a0a0a;--other:#3b3b3b;--wash1:transparent;--wash2:transparent;
+  --card:#141414;--edge:#313131;--ctl:#3b3b3b;--ctlhi:#454545;--soft:#b1b1b1;--shadow:0 0 #0000;--hi:0 0 #0000;--shadow-lg:0 24px 60px -20px rgba(0,0,0,.9),0 0 0 1px #262626;color-scheme:dark;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}
+[data-style=stacked] body{background:var(--bg)!important}
+[data-style=stacked] :is(.panel,dialog){background:var(--panel)!important;border:1px solid var(--line)!important;box-shadow:none!important;border-radius:16px}
+[data-style=stacked] :is(.tile,.card,.post,.th,.capw){background:var(--card)!important;border:1px solid var(--line)!important;box-shadow:none!important;border-radius:12px}
+[data-style=stacked] :is(.panel .post,.panel .card,.panel .tile,.panel .th,dialog .post,dialog .card){background:var(--card)!important;border-color:var(--line)!important}
+[data-style=stacked] .panel .post:hover,[data-style=stacked] .th.open:hover,[data-style=stacked] .capw:hover,[data-style=stacked] .scard.clickcard:hover{border-color:var(--ctlhi)!important;box-shadow:none!important}
+[data-style=stacked] .th.open:hover{transform:none}
+[data-style=stacked] .card{border-left-width:2px!important}
+[data-style=stacked] nav{background:var(--side)!important;box-shadow:none!important;border-right:1px solid #1a1a1a!important}
+[data-style=stacked] nav a{color:var(--muted);font-weight:500}[data-style=stacked] nav a:hover{background:#141414;color:var(--ink)}
+[data-style=stacked] nav a.on{background:var(--sunk)!important;box-shadow:none!important;color:var(--ink)}
+[data-style=stacked] .topbar{background:rgba(10,10,10,.85)!important;border-bottom:1px solid #1a1a1a}
+[data-style=stacked] .topbar h1{font-weight:600;letter-spacing:-.01em}
+/* sentence case everywhere: Stacked never shouts its labels */
+[data-style=stacked] :is(h2,th,.fml,.draftlbl,.capneeds,.termside .tshead,.parkedh,.thst,.crewh,.sdh,.nowline,.askhdr,.status){text-transform:none;letter-spacing:0;font-weight:500}
+[data-style=stacked] h2{font-size:13px}[data-style=stacked] .parkedh{font-size:12.5px;color:var(--muted)}
+[data-style=stacked] th{font-size:12.5px;color:var(--muted);font-weight:400}
+[data-style=stacked] :is(th,td){border-bottom-color:var(--sunk)}[data-style=stacked] tbody tr:hover{background:#141414}
+[data-style=stacked] .ptitle b{font-size:15px;font-weight:500;letter-spacing:0}
+[data-style=stacked] .tile .k{color:var(--ink);font-size:13.5px;font-weight:500}
+[data-style=stacked] .tile .n{font-weight:400;letter-spacing:-.01em}
+[data-style=stacked] .tile .s{color:var(--muted)}
+[data-style=stacked] .tree,[data-style=stacked] .post-head .tname{font-weight:600}
+[data-style=stacked] :is(.pill,.chip){background:transparent!important;border:1px solid var(--edge);color:var(--soft);font-weight:500;box-shadow:none}
+[data-style=stacked] .pill{padding:1px 8px}[data-style=stacked] .chip{padding:0 6px}
+[data-style=stacked] :is(.pill,.chip):is(.waiting,.working,.bad,.warn,.ok,.agentpill)::before{content:"";display:inline-block;width:5px;height:5px;border-radius:50%;background:var(--pd);margin-right:5px;vertical-align:1px}
+[data-style=stacked] :is(.pill,.chip).waiting{--pd:var(--wait)}[data-style=stacked] :is(.pill,.chip):is(.working,.agentpill){--pd:var(--work)}[data-style=stacked] :is(.pill,.chip).bad{--pd:var(--bad)}[data-style=stacked] :is(.pill,.chip).warn{--pd:var(--warn)}[data-style=stacked] :is(.pill,.chip).ok{--pd:var(--ok)}
+[data-style=stacked] .pill.simpill{color:var(--soft)}
+[data-style=stacked] nav a .count{background:var(--sunk)}[data-style=stacked] nav a .count.hot{background:color-mix(in srgb,var(--bad) 18%,transparent)}
+[data-style=stacked] button{background:transparent;border:1px solid var(--ctl);border-radius:8px;color:var(--ink);box-shadow:none!important}
+[data-style=stacked] button:hover{border-color:var(--ctlhi);background:#141414}[data-style=stacked] button:active{filter:none}
+[data-style=stacked] button.danger{color:var(--bad)}[data-style=stacked] button.danger:hover{border-color:color-mix(in srgb,var(--bad) 55%,var(--ctl))}
+[data-style=stacked] :is(button.primary,.yt-row .sendbtn){background:var(--accent)!important;border:1px solid var(--accent)!important;color:var(--onaccent)!important;font-weight:500;box-shadow:none!important}
+[data-style=stacked] :is(button.primary,.yt-row .sendbtn):hover{background:#e3e3e3!important;border-color:#e3e3e3!important;filter:none}
+[data-style=stacked] :is(.hact,.cardchev,.renamebtn,.iconbtn,.xbtn,.seg button,.prx,.copybtn,.locknav,.post-hist button.earlier,.chatbar button.earlier,.ptitle .fold){border-color:transparent!important;background:transparent!important}
+[data-style=stacked] :is(.hact,.iconbtn,.xbtn,.copybtn,.cardchev,.renamebtn):hover{background:var(--sunk)!important}
+[data-style=stacked] .cvhead [data-closeconvo]{background:var(--sunk)}
+[data-style=stacked] .seg{background:#141414!important;box-shadow:inset 0 0 0 1px var(--line)!important}
+[data-style=stacked] .seg::before{background:#272727!important;box-shadow:none!important}
+[data-style=stacked] .seg button{color:var(--muted)}[data-style=stacked] .seg button.on{color:var(--ink)}
+[data-style=stacked] :is(.yt-reply textarea,input:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]),select,.prq,.ntin){background:var(--bg)!important;border:1px solid var(--ctl)!important;border-radius:8px;color:var(--ink);box-shadow:none!important}
+[data-style=stacked] :is(.yt-reply textarea,input:not([type=checkbox]):not([type=radio]):not([type=range]),select,.prq,.ntin):focus{outline:none;border-color:var(--ctlhi)!important;box-shadow:0 0 0 3px rgba(255,255,255,.06)!important}
+[data-style=stacked] :is(.meter,.bar,.membar,.thmem,.blocks i.empty,.stack){background:var(--sunk)!important;box-shadow:none!important}
+[data-style=stacked] .meter span{background:var(--ok)}[data-style=stacked] .meter span.warn{background:var(--warn)}[data-style=stacked] .meter span.bad{background:var(--bad)}
+[data-style=stacked] .gridl{stroke:var(--grid);stroke-dasharray:3 3}
+[data-style=stacked] .chart .tip{background:var(--card);border-color:var(--edge);box-shadow:0 8px 24px rgba(0,0,0,.6)}
+[data-style=stacked] .legend i,[data-style=stacked] .legendrow i{border-radius:50%}
+[data-style=stacked] :is(.feedmap,.capsay,.thstat,.pk,.sdic){background:#141414!important;box-shadow:none!important}
+[data-style=stacked] .feedmap{border:1px solid var(--line)}
+[data-style=stacked] .fmchip{background:transparent!important;border-color:var(--edge)!important}
+[data-style=stacked] .fmchip.cur{background:var(--sunk)!important;border-color:var(--ctlhi)!important;box-shadow:none!important}
+[data-style=stacked] .bub{background:var(--sunk);box-shadow:none}[data-style=stacked] .bub.you{background:#272727}
+[data-style=stacked] .askbox{background:color-mix(in srgb,var(--wait) 6%,var(--card))}
+[data-style=stacked] .alert{border-color:color-mix(in srgb,var(--bad) 55%,var(--line))!important;background:color-mix(in srgb,var(--bad) 6%,var(--card))!important}
+[data-style=stacked] :is(.slashpop,.pathmenu,.stopper,.subbar){background:var(--card)!important;border-color:var(--edge)!important;box-shadow:0 16px 40px -12px rgba(0,0,0,.8)!important}
+[data-style=stacked] dialog{box-shadow:var(--shadow-lg)!important}[data-style=stacked] dialog::backdrop{background:rgba(0,0,0,.7)}
+[data-style=stacked] .toast{background:var(--ink);color:var(--bg)}
+[data-style=stacked] :is(.ticon svg,.avatar,.brandlogo){box-shadow:none!important}[data-style=stacked] .ticon b{box-shadow:0 0 0 2px var(--card)}
+[data-style=stacked] .termhost{background:var(--bg)}[data-style=stacked] .termempty{color:var(--muted)}
+[data-style=stacked] .tsterm:hover,[data-style=stacked] .tsterm.on,[data-style=stacked] .termtab.on{background:var(--sunk)}
+[data-style=stacked] :is(.feedscroll,.panes>.col){scrollbar-color:#2a2a2a transparent}[data-style=stacked] :is(.feedscroll,.panes>.col)::-webkit-scrollbar-thumb{background:#2a2a2a;background-clip:content-box}
+[data-style=stacked] ::selection{background:rgba(255,255,255,.18)}
+[data-style=stacked] a{color:var(--ink)}[data-style=stacked] a:hover{color:#fff}
+/* numbers are set in the sans with tabular figures, as on Stacked's charts and stat cards; code and paths stay mono */
+[data-style=stacked] :is(.axis,.ptitle .v,.hbars .gb,.hbars .pc,.vlegend b){font-family:var(--sans);font-variant-numeric:tabular-nums}
+[data-style=stacked] .yt-row .sendbtn{border-radius:8px!important;font-weight:500}
+[data-style=stacked] .yt-row.empty .sendbtn{background:var(--sunk)!important;border-color:var(--sunk)!important;color:var(--muted)!important;opacity:1}
 
 .termwrap{display:grid;grid-template-columns:300px 1fr;gap:12px;height:calc(100vh - 96px);min-height:420px}
 .termside{overflow:auto;padding:12px 12px 16px;display:flex;flex-direction:column;gap:14px}
@@ -3190,7 +3262,9 @@ function idMeta(t){return (S&&S.ids&&S.ids[t])||null}
 function slotOf(t){var m=idMeta(t);if(m)return m.slot;var p=String(t).split(':');return p.length>2?p[2]:String(t)}
 function hashT(t){var h=0;t=String(t);for(var i=0;i<t.length;i++)h=(h*31+t.charCodeAt(i))|0;return Math.abs(h)}
 function isMainT(t){var s=slotOf(t);return t==='main'||s==='main'||s==='dir'}
-function colorFor(t){if(isMainT(t))return '#7B88A1';var n=parseInt(slotOf(t),10);return PALETTE[((n||hashT(t)+1)-1)%PALETTE.length]}
+// Stacked swaps Nord's pastels for the saturated series colors of its revenue chart
+var PALETTE_STACKED=['#22C55E','#3B82F6','#A855F7','#EC4899','#F59E0B','#14B8A6','#978DFF','#FF4259','#06B6D4','#84CC16','#F97316','#6366F1','#D946EF','#EAB308','#10B981','#60A5FA','#C084FC','#FB7185','#FBBF24','#2DD4BF'];
+function colorFor(t){if(isMainT(t))return STYLE==='stacked'?'#898989':'#7B88A1';var P=STYLE==='stacked'?PALETTE_STACKED:PALETTE,n=parseInt(slotOf(t),10);return P[((n||hashT(t)+1)-1)%P.length]}
 function $(id){return document.getElementById(id)}
 function $H(id){return {set html(v){var e=$(id);if(e&&e._h!==v){e._h=v;e.innerHTML=v}}}}
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
@@ -3845,9 +3919,9 @@ function renderSettings(){
       field('Warn above','Shows a warning when more dev servers than this are running.','<input type="number" id="budget" min="0" value="'+st.serverBudget+'"><span class="unit">servers</span>')+
       '<div class="ffoot"><button class="primary" id="save">Save</button></div></div>'+
     '<div class="panel form"><div class="fhead"><b>Appearance</b><p>How the dashboard looks.</p></div>'+field('Theme','Auto follows your Mac.','<div class="seg" style="width:210px"><button data-t="auto" class="'+(theme==='auto'?'on':'')+'">Auto</button><button data-t="light" class="'+(theme==='light'?'on':'')+'">Light</button><button data-t="dark" class="'+(theme==='dark'?'on':'')+'">Dark</button></div>')+
-      field('Style','Nord is the soft 3D default. Valorant is dark and angular, and ignores the light/dark theme.','<div class="seg" style="width:270px"><button data-style="nord" class="'+(STYLE==='nord'?'on':'')+'">Nord</button><button data-style="flat" class="'+(STYLE==='flat'?'on':'')+'">Flat</button><button data-style="valorant" class="'+(STYLE==='valorant'?'on':'')+'">Valorant</button></div>')+
+      field('Style','Stacked (default) is near-black with hairline borders. Nord is soft 3D. Stacked and Valorant ignore the theme.','<div class="seg" style="width:360px"><button data-style="stacked" class="'+(STYLE==='stacked'?'on':'')+'">Stacked</button><button data-style="nord" class="'+(STYLE==='nord'?'on':'')+'">Nord</button><button data-style="flat" class="'+(STYLE==='flat'?'on':'')+'">Flat</button><button data-style="valorant" class="'+(STYLE==='valorant'?'on':'')+'">Valorant</button></div>')+
       field('Profiles','Saved looks: theme, style and font together. Click one to switch, or type theme in the / bar.',profilesHtml())+
-      field('Font','Applies instantly. Numbers use the paired mono font.','<div class="fontgrid">'+Object.keys(FONTS).map(function(k){var f=FONTS[k],on=(lsGet('treehouse-font')||'system')===k;return '<button class="fontopt'+(on?' on':'')+'" data-font="'+k+'"><span class="fs" style="font-family:'+esc(f.sans)+'">pebtree</span><span class="fm" style="font-family:'+esc(f.mono)+'">23.0 GB · 1h · :8081</span><span class="fl">'+f.label+'</span></button>'}).join('')+'</div>')+'</div>'+
+      field('Font','Applies instantly. Numbers use the paired mono font.','<div class="fontgrid">'+Object.keys(FONTS).map(function(k){var f=FONTS[k],on=(lsGet('treehouse-font')||'stacked')===k;return '<button class="fontopt'+(on?' on':'')+'" data-font="'+k+'"><span class="fs" style="font-family:'+esc(f.sans)+'">pebtree</span><span class="fm" style="font-family:'+esc(f.mono)+'">23.0 GB · 1h · :8081</span><span class="fl">'+f.label+'</span></button>'}).join('')+'</div>')+'</div>'+
     '<div class="panel form"><div class="fhead"><b>Lock</b><p>Locks pebtree behind a passcode. pebtree itself refuses everything while locked, so it cannot be bypassed from the browser.</p></div>'+
       (S.lock&&S.lock.set?field('Current passcode','Needed to change or remove it.','<input type="password" id="lkcur" autocomplete="current-password">'):'')+
       field(S.lock&&S.lock.set?'New passcode':'Passcode',S.lock&&S.lock.set?'Leave empty to keep the current one.':'At least 4 characters.','<input type="password" id="lknew" autocomplete="new-password">')+
@@ -4352,20 +4426,20 @@ function cleanup(mode,minutes){
       var by={};c.forEach(function(i){(by[i.dataset.reason]=by[i.dataset.reason]||[]).push(+i.value)});Object.keys(by).forEach(function(r){stopMany(by[r],r)})};
   });
 }
-var STYLE=lsGet('treehouse-style')||'nord';
+var STYLE=lsGet('treehouse-style')||'stacked';
 // A theme profile is a saved look: light/dark theme, style and font. Built-ins can't be deleted; yours can.
-var BUILTIN_PROFILES=[{name:'Nord',theme:'auto',style:'nord'},{name:'Nord dark',theme:'dark',style:'nord'},{name:'Flat',theme:'auto',style:'flat'},{name:'Valorant',theme:'dark',style:'valorant'}];
+var BUILTIN_PROFILES=[{name:'Stacked',theme:'dark',style:'stacked',font:'stacked'},{name:'Nord',theme:'auto',style:'nord'},{name:'Nord dark',theme:'dark',style:'nord'},{name:'Flat',theme:'auto',style:'flat'},{name:'Valorant',theme:'dark',style:'valorant'}];
 function myProfiles(){try{return JSON.parse(lsGet('treehouse-profiles')||'[]')}catch(e){return []}}
 function allProfiles(){return BUILTIN_PROFILES.map(function(p){return Object.assign({builtin:true},p)}).concat(myProfiles())}
-function currentLook(){return {theme:lsGet('devdeck-theme')||'auto',style:STYLE,font:lsGet('treehouse-font')||'system'}}
-function isCurrent(p){var c=currentLook();return (p.theme===c.theme||p.style==='valorant')&&p.style===c.style&&(!p.font||p.font===c.font)}
-function profileDesc(p){return [p.theme==='auto'?'auto light/dark':p.theme,p.style==='nord'?'Nord 3D':p.style==='flat'?'flat':'Valorant',p.font?(FONTS[p.font]||{}).label:''].filter(Boolean).join(' · ')}
+function currentLook(){return {theme:lsGet('devdeck-theme')||'auto',style:STYLE,font:lsGet('treehouse-font')||'stacked'}}
+function isCurrent(p){var c=currentLook();return (p.theme===c.theme||p.style==='valorant'||p.style==='stacked')&&p.style===c.style&&(!p.font||p.font===c.font)}
+function profileDesc(p){return [p.theme==='auto'?'auto light/dark':p.theme,p.style==='nord'?'Nord 3D':p.style==='flat'?'flat':p.style==='stacked'?'Stacked':'Valorant',p.font?(FONTS[p.font]||{}).label:''].filter(Boolean).join(' · ')}
 function applyProfile(name){var p=allProfiles().find(function(q){return q.name===name});if(!p)return;setTheme(p.theme);if(p.font&&FONTS[p.font]){lsSet('treehouse-font',p.font);applyFont(p.font)}setStyle(p.style);toast('Theme: '+p.name)}
 function saveProfile(name){name=String(name||'').trim().slice(0,40);if(!name){toast('Name the profile first');return}if(BUILTIN_PROFILES.some(function(b){return b.name.toLowerCase()===name.toLowerCase()})){toast('That name is a built-in profile');return}
   var list=myProfiles().filter(function(q){return q.name!==name});list.push(Object.assign({name:name},currentLook()));lsSet('treehouse-profiles',JSON.stringify(list));toast('Saved theme profile "'+name+'"');render()}
 function deleteProfile(name){lsSet('treehouse-profiles',JSON.stringify(myProfiles().filter(function(q){return q.name!==name})));toast('Deleted "'+name+'"');render()}
 function profilesHtml(){return '<div class="profs">'+allProfiles().map(function(p){return '<span class="prof'+(isCurrent(p)?' on':'')+'"><button data-prof="'+esc(p.name)+'" data-tip="'+esc(profileDesc(p))+'">'+esc(p.name)+'</button>'+(p.builtin?'':'<button class="profx" data-profdel="'+esc(p.name)+'" data-tip="Delete this profile"><svg viewBox="0 0 24 24"><path d="M7 7l10 10M17 7L7 17"/></svg></button>')+'</span>'}).join('')+'</div><div class="profsave"><input id="profname" maxlength="40" placeholder="Name the current look"><button data-profsave="1">Save</button></div>'}
-function setStyle(v){STYLE=v;lsSet('treehouse-style',v==='nord'?'':v);if(v==='nord')delete document.documentElement.dataset.style;else document.documentElement.dataset.style=v;document.querySelectorAll('#settings .seg button[data-style]').forEach(function(b){b.classList.toggle('on',b.dataset.style===v)});syncSegs();if(S&&!S.loading){document.querySelectorAll('.chart').forEach(function(c){c._h=null})}render()}
+function setStyle(v){STYLE=v;lsSet('treehouse-style',v);if(v==='nord')delete document.documentElement.dataset.style;else document.documentElement.dataset.style=v;document.querySelectorAll('#settings .seg button[data-style]').forEach(function(b){b.classList.toggle('on',b.dataset.style===v)});syncSegs();if(S&&!S.loading){document.querySelectorAll('.chart').forEach(function(c){c._h=null})}render()}
 function setTheme(t){lsSet('devdeck-theme',t);if(t==='auto')delete document.documentElement.dataset.theme;else document.documentElement.dataset.theme=t;markTheme();if(S&&!S.loading){document.querySelectorAll('.chart').forEach(function(c){c._h=null});render()}}
 function foldKey(pn){var v=pn.closest('.view'),b=pn.querySelector('.ptitle>b');return 'treehouse-fold:'+(v?v.id:'')+':'+(b?b.textContent.trim():'')}
 function syncFolds(){var F;try{F=JSON.parse(lsGet('treehouse-folds')||'{}')}catch(e){F={}}document.querySelectorAll('.panel>.ptitle').forEach(function(t){var pn=t.parentNode;if(!t.querySelector('.fold')){t.classList.add('foldable');t.insertAdjacentHTML('afterbegin','<button class="fold" title="Collapse section"><svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg></button>')}var f=!!F[foldKey(pn)];if(pn.classList.contains('folded')!==f){pn.classList.toggle('folded',f);if(typeof sizeFeed==='function')sizeFeed()}t.querySelector('.fold').title=f?'Expand section':'Collapse section'})}
@@ -4436,7 +4510,7 @@ function termLabel(host,session){var x=(S.sessions||[]).find(function(q){return 
 function openTerm(host,session,label){if(location.hash!=='#terms')location.hash='terms';
   loadXterm().then(function(){var k=host+'/'+session,t=TERM.tabs.find(function(x){return x.key===k});if(!t){t=newTerm(host,session,label||termLabel(host,session));TERM.tabs.push(t)}showTerm(k)},function(){toast('Could not load the terminal (xterm.js); see the pebtree log')})}
 function newTerm(host,session,label){var el=document.createElement('div');el.className='xt';$('termhost').appendChild(el);
-  var term=new Terminal({fontFamily:'ui-monospace,"SF Mono",Menlo,monospace',fontSize:13,cursorBlink:true,scrollback:5000,macOptionIsMeta:true,allowProposedApi:true,theme:{background:'#0b0e14',foreground:'#D8DEE9',cursor:'#88C0D0',selectionBackground:'rgba(136,192,208,.35)'}});
+  var term=new Terminal({fontFamily:'ui-monospace,"SF Mono",Menlo,monospace',fontSize:13,cursorBlink:true,scrollback:5000,macOptionIsMeta:true,allowProposedApi:true,theme:STYLE==='stacked'?{background:'#0a0a0a',foreground:'#f5f5f5',cursor:'#f5f5f5',selectionBackground:'rgba(255,255,255,.2)'}:{background:'#0b0e14',foreground:'#D8DEE9',cursor:'#88C0D0',selectionBackground:'rgba(136,192,208,.35)'}});
   var fit=new FitAddon.FitAddon();term.loadAddon(fit);term.open(el);
   var t={key:host+'/'+session,host:host,session:session,label:label,el:el,term:term,fit:fit,ws:null,alive:false,closed:false,retry:0,ended:false};
   term.onData(function(d){if(t.ws&&t.ws.readyState===1)t.ws.send(JSON.stringify({i:d}));else if(t.ended&&d==='\r'){t.ended=false;connectTerm(t)}});

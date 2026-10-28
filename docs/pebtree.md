@@ -18,7 +18,7 @@ This document is the contract for running it anywhere: what it needs, how to set
 - **Trees, Sessions, Processes, Cleanup:** every dev server with its real memory, idle and orphan cleanup, a cap on how many trees run at once, and Close tree (stop its processes, return the worktree, close its tab).
 - **Proof:** screenshots and test output that sessions send you with `pebtree proof`.
 - **Journal:** one entry per day, written from your GitHub history by a Claude skill.
-- **Look:** light or dark theme, a style (Nord's soft 3D, Flat, or Valorant), and a font, set in Settings → Appearance. Save a combination as a theme profile and switch with one click or by typing `theme` in the `/` bar.
+- **Look:** light or dark theme, a style (Stacked, the default: near-black and minimal, modeled on the stacked.com dashboard; Nord's soft 3D; Flat; or Valorant), and a font (Inter + Roboto Mono by default), set in Settings → Appearance. Save a combination as a theme profile and switch with one click or by typing `theme` in the `/` bar.
 - **Keyboard:** `/` command bar, `⌘[` `⌘]` pages, `⌘⇧[` `⌘⇧]` cards, `⌘Z` reopen the session you just answered, `?` for the full list.
 
 ## Requirements
