@@ -525,8 +525,8 @@ async function spawnSession(spec) {
   fs.mkdirSync(LAUNCH_DIR, { recursive: true });
   let prompt = '';
   if (String(spec.prompt || '').trim()) { const pf = path.join(LAUNCH_DIR, `${Date.now()}-${rand}.md`); fs.writeFileSync(pf, String(spec.prompt)); prompt = ` "$(cat ${shq(pf)})"`; }
-  // a prompt written by someone else (a ticket) never runs with permission prompts switched off
-  const args = spec.untrusted ? CLAUDE_ARGS.filter((a) => !/^--dangerously-skip-permissions$|^--permission-mode(=bypassPermissions)?$|^bypassPermissions$/.test(a)) : CLAUDE_ARGS;
+  // a prompt written by someone else (a ticket) gets none of config.json's flags, only Claude's default permission prompts
+  const args = spec.untrusted ? ['--permission-mode', 'default'] : CLAUDE_ARGS;
   const claude = ['claude', ...args, ...(spec.title ? ['-n', String(spec.title).slice(0, 50)] : [])].map(shq).join(' ') + prompt;
   const shell = 'exec "${SHELL:-/bin/sh}" -l';
   const has = async (n) => (await runOk('tmux', ['has-session', '-t', `=${n}`], { timeout: 4000 })).ok;
