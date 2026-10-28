@@ -148,6 +148,20 @@ async function readProcesses() {
   return procs;
 }
 
+// Resident memory by app, so the swap warning can name what is holding it: helpers count toward their outermost .app (ps
+// cuts comm short, so names come from the command line),
+// and every process inside a simulator runtime counts as the iOS Simulator. RSS double-counts shared pages; it ranks well enough.
+function appMemory(procs) {
+  const by = new Map();
+  for (const p of procs.values()) {
+    const a = p.args.match(/^[^]*?\/([^/]+)\.(app|xpc)\//);
+    let name = /CoreSimulator\//.test(p.args) || (a && a[1] === 'Simulator') ? 'iOS Simulator' : a ? a[1] : path.basename(p.args.split(/\s/)[0]) || p.comm;
+    if (name === 'com.apple.Virtualization.VirtualMachine') name = 'Virtual machine';
+    by.set(name, (by.get(name) || 0) + p.rssMB);
+  }
+  return [...by].map(([name, mb]) => ({ name, memMB: Math.round(mb) })).filter((x) => x.memMB >= 250).sort((a, b) => b.memMB - a.memMB).slice(0, 4);
+}
+
 async function readCwds(pids) {
   const cwds = new Map();
   if (!pids.length) return cwds;
@@ -1498,7 +1512,7 @@ async function refreshFast() {
   const treeMem = {};
   const treeCpu = {};
   for (const s of sessions) { treeMem[s.tree] = Math.round(s.memMB); treeCpu[s.tree] = +s.cpu.toFixed(1); }
-  const sys = { ...top.sys, ...swap, totalMB: TOTAL_RAM_MB, cores: os.cpus().length, load: os.loadavg(), lanIp: lanIp() };
+  const sys = { ...top.sys, ...swap, apps: appMemory(procs), totalMB: TOTAL_RAM_MB, cores: os.cpus().length, load: os.loadavg(), lanIp: lanIp() };
   recordSample({
     t: now, cpu: +(sys.cpuUser + sys.cpuSys).toFixed(1), used: Math.round(sys.usedMB), swap: Math.round(sys.swapUsedMB), comp: Math.round(sys.compressorMB),
     servers: [...services.values()].filter((s) => SERVER_KINDS.has(s.kind)).length, working: sessions.filter((s) => s.claudeState === 'working').length,
@@ -3287,11 +3301,12 @@ function pressure(){var s=S.sys,sp=s.swapTotalMB?s.swapUsedMB/s.swapTotalMB*100:
 
 function renderAlert(){
   var s=S.sys,sp=s.swapTotalMB?s.swapUsedMB/s.swapTotalMB*100:0,servers=S.servers.filter(function(x){return x.kind==='next'||x.kind==='metro'}),orph=S.servers.filter(function(x){return x.orphan}),msgs=[];
-  if(sp>50||s.freePct<15)msgs.push('<b>Your Mac is swapping '+gb(s.swapUsedMB)+'.</b> Dev processes use '+gb(S.servers.reduce(function(a,x){return a+x.memMB},0))+'.');
+  var devMB=S.servers.reduce(function(a,x){return a+x.memMB},0),apps=(s.apps||[]).slice(0,3);
+  if(sp>50||s.freePct<15)msgs.push('<b>Your Mac is swapping '+gb(s.swapUsedMB)+'.</b>'+(apps.length?' Most memory: '+apps.map(function(a){return esc(a.name)+' '+gb(a.memMB)}).join(' · ')+'.':'')+(devMB>=100?' Dev processes use '+gb(devMB)+'.':''));
   if(S.settings.serverBudget&&servers.length>S.settings.serverBudget)msgs.push('<b>'+servers.length+' dev servers running</b>, over your budget of '+S.settings.serverBudget+'.');
   if(S.pool&&S.pool.max&&S.pool.inUse>=S.pool.max)msgs.push('<b>Tree pool is full</b> ('+S.pool.inUse+' of '+S.pool.max+'). The next new session cannot get a tree.');
   if(orph.length)msgs.push('<b>'+orph.length+' orphaned process group'+(orph.length>1?'s':'')+'</b> ('+gb(orph.reduce(function(a,x){return a+x.memMB},0))+') whose terminal is gone.');
-  $H('alert').html=msgs.length?'<div class="panel alert"><div class="grow">'+msgs.join('<br>')+'</div><button class="primary roundbtn" data-cleanup="all" data-tip="Clean up dev servers" aria-label="Clean up dev servers"><svg viewBox="0 0 24 24"><path d="M15 3.5L12 12" stroke-width="2.2"/><rect x="4" y="12" width="16" height="3.6" rx="1.5" fill="currentColor" stroke="none"/><path d="M6 15.6v4.9M9 15.6v4.9M12 15.6v4.9M15 15.6v4.9M18 15.6v4.9" stroke-width="1.6"/></svg></button></div>':'';
+  $H('alert').html=msgs.length?'<div class="panel alert"><div class="grow">'+msgs.join('<br>')+'</div>'+(S.servers.length?'<button class="primary roundbtn" data-cleanup="all" data-tip="Clean up dev servers" aria-label="Clean up dev servers"><svg viewBox="0 0 24 24"><path d="M15 3.5L12 12" stroke-width="2.2"/><rect x="4" y="12" width="16" height="3.6" rx="1.5" fill="currentColor" stroke="none"/><path d="M6 15.6v4.9M9 15.6v4.9M12 15.6v4.9M15 15.6v4.9M18 15.6v4.9" stroke-width="1.6"/></svg></button>':'')+'</div>':'';
 }
 var SENT={},LOCKH={},FORCE={},SECT={},RSEQ=0,ARCHOPEN=!!lsGet('treehouse-archopen');
 function sortKey(x){return SENT[x.tree]?SENT[x.tree].key:x.lastActive}
