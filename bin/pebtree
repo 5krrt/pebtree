@@ -3173,7 +3173,11 @@ var TOKEN='__TOKEN__',BUILD='__BUILD__';
 // pebtree was updated: reload into the new version once you are not mid-reply, and reopen the conversation you had open.
 // It never reloads under you: right away only while the tab is in the background, otherwise after a minute
 // with no mouse or keys, and meanwhile a small button lets you take the update when it suits you.
-var LASTINPUT=Date.now();['pointerdown','keydown','wheel','pointermove'].forEach(function(t){addEventListener(t,function(){LASTINPUT=Date.now()},{passive:true,capture:true})});
+var LASTINPUT=Date.now(),LASTACT=0;['pointerdown','keydown','wheel','pointermove'].forEach(function(t){addEventListener(t,function(){LASTINPUT=Date.now();if(t!=='pointermove')LASTACT=LASTINPUT},{passive:true,capture:true})});
+// Updates from pebtree never land in the middle of a keystroke or click: they wait until you pause (at most
+// 500ms), then draw on the next frame. A hidden tab draws nothing until you come back to it.
+var DRQ=0;function dataRender(){if(DRQ)return;DRQ=1;var since=Date.now();(function go(){if(document.hidden){DRQ=2;return}var q=Date.now()-LASTACT;if(q<150&&Date.now()-since<500){setTimeout(go,150-q);return}requestAnimationFrame(function(){DRQ=0;if(S&&!S.loading)render()})})()}
+document.addEventListener('visibilitychange',function(){if(!document.hidden&&DRQ===2){DRQ=0;dataRender()}});
 function doReload(){try{if($('convo').open&&CONVO)sessionStorage.setItem('pebtree-reopen',CONVO)}catch(e){}location.reload()}
 function maybeReload(build){if(!build||build===BUILD)return;var b=$('updbtn');if(b)b.classList.add('on');
   var ae=document.activeElement,busy=!!(ae&&(ae.tagName==='TEXTAREA'||ae.tagName==='INPUT'))||$('dlg').open||$('cmdk').open;if(busy)return;
@@ -3217,10 +3221,12 @@ function histFor(rid){var span=RANGE_MS[rangeOf(rid)],now=S.at||Date.now(),src=s
 // Tree memory adds up shared memory once per process, so it can spike past the Mac's RAM. Those charts use a
 // fixed scale of 1.25x the RAM (30 GB on 24 GB): it never jumps as history loads, and a spike runs along the top.
 function memCap(){return (S.sys&&S.sys.totalMB||24576)*1.25}
+var CHART_RO=window.ResizeObserver?new ResizeObserver(function(es){var moved=false;es.forEach(function(e){var w=Math.round(e.contentRect.width);if(w&&w!==e.target._w){e.target._w=w;moved=true}});if(moved)dataRender()}):null;
 function chart(id,opt){
-  var el=$(id);if(!el)return;var w=el.clientWidth||600,h=Math.max(opt.height||Math.round(Math.min(340,Math.max(160,w*0.42))),opt.minHeight||0),padL=46,padB=20,padT=6,padR=6;
-  var pts=histFor(opt.rid||id);if(pts.length<2){$H(id).html='<div class="empty" style="height:'+h+'px">Collecting data. Wider ranges fill in over time.</div>';return}
+  var el=$(id);if(!el)return;if(!el._ro&&CHART_RO){el._ro=1;CHART_RO.observe(el)}var w=el._w||(el._w=el.clientWidth)||600,h=Math.max(opt.height||Math.round(Math.min(340,Math.max(160,w*0.42))),opt.minHeight||0),padL=46,padB=20,padT=6,padR=6;
+  var pts=histFor(opt.rid||id);if(pts.length<2){el._key='';$H(id).html='<div class="empty" style="height:'+h+'px">Collecting data. Wider ranges fill in over time.</div>';return}
   var t0=pts[0].t,t1=pts[pts.length-1].t,span=Math.max(1,t1-t0);
+  var key=[w,h,pts.length,t0,t1,coarseAt,opt.yMax,opt.limit,opt.series.map(function(s){return s.name+s.color}).join()].join('|');if(el._key===key)return;el._key=key;
   var series=opt.series.map(function(s){return {name:s.name,color:s.color,vals:pts.map(s.get)}});
   var stackTop=pts.map(function(_,i){return 0});var maxV=0;
   if(opt.stacked){series.forEach(function(s){s.base=stackTop.slice();s.vals.forEach(function(v,i){stackTop[i]+=v||0});s.top=stackTop.slice()});maxV=Math.max.apply(null,stackTop)}
@@ -3540,13 +3546,15 @@ function renderYourTurn(){
   $('yt-count').textContent=fresh.length;
   $('yt-sub').innerHTML=(ORDER.length?'your order · <a href="#" data-resetorder="1">reset</a>':'newest first')+(skipped?' · '+skipped+' skipped':'');
   $('yt-empty').textContent=fresh.length?'':'Nothing is waiting on you.';$('yt-head').querySelector('.secl').textContent='Your turn · '+fresh.length+' waiting for you';
-  var before={};document.querySelectorAll('#yourturn .post').forEach(function(p){before[p.dataset.tree]=p.getBoundingClientRect().top});RSEQ++;
   var pinned=groups.pinned.sort(function(a,b){return PINS[a.tree]-PINS[b.tree]});if(hold)pinned.sort(function(a,b){var A=domIx[a.tree],B=domIx[b.tree];return (A?A.i:1e6)-(B?B.i:1e6)});
+  // cards slide only when the order or sections change; measuring them on every update cost two full layouts
+  var order=[pinned,fresh,working,parked,archive].map(function(g){return g.map(function(x){return x.tree}).join()}).join('|'),moved=!hold&&box._order!==undefined&&box._order!==order;box._order=order;
+  var before={};if(moved)document.querySelectorAll('#yourturn .post').forEach(function(p){before[p.dataset.tree]=p.getBoundingClientRect().top});RSEQ++;
   syncPosts($('yt-pinned-list'),pinned,false,hold);syncPosts($('yt-list'),fresh,false,hold);syncPosts($('yt-working-list'),working,true,hold);syncPosts($('yt-parked-list'),parked,true,hold);syncPosts($('yt-archive-list'),archive,true,hold);
   if(!hold)document.querySelectorAll('#yourturn .post').forEach(function(p){if(p._seq!==RSEQ&&!p.querySelector('textarea:focus'))p.remove()});
   var wk0=$('yt-working'),pk0=$('yt-parked');wk0.style.display=working.length?'':'none';pk0.style.display=parked.length?'':'none';
   if(holdCard){var fs=box.querySelector('.feedscroll'),dyH=ae.getBoundingClientRect().top-holdTop;if(fs&&Math.abs(dyH)>0.5)fs.scrollTop+=dyH}
-  if(!hold)document.querySelectorAll('#yourturn .post').forEach(function(p){var b=before[p.dataset.tree];if(b===undefined||!p.animate)return;var dy=b-p.getBoundingClientRect().top;if(Math.abs(dy)>2)p.animate([{transform:'translateY('+dy+'px)'},{transform:'none'}],{duration:280,easing:'cubic-bezier(.2,.8,.2,1)'})});
+  if(moved)document.querySelectorAll('#yourturn .post').forEach(function(p){var b=before[p.dataset.tree];if(b===undefined||!p.animate)return;var dy=b-p.getBoundingClientRect().top;if(Math.abs(dy)>2)p.animate([{transform:'translateY('+dy+'px)'},{transform:'none'}],{duration:280,easing:'cubic-bezier(.2,.8,.2,1)'})});
   var wk=$('yt-working');wk.style.display=working.length?'':'none';wk.querySelector('.parkedh .secl').textContent='Working · '+working.length+' busy right now';
   var pn=$('yt-pinned');pn.style.display=pinned.length?'':'none';pn.querySelector('.parkedh .secl').textContent='Pinned · '+pinned.length;
   feedMap([['Pinned',pinned],['Your turn',fresh],['Working',working],['Pending',parked],['Archive',archive]]);
@@ -3574,6 +3582,8 @@ var ORDER=(function(){try{return JSON.parse(lsGet('treehouse-cardorder')||'[]')}
 function manualSort(items){if(!ORDER.length)return items;var pos={};ORDER.forEach(function(t,i){pos[t]=i});return items.map(function(x,i){return {x:x,k:pos[x.tree]===undefined?1e6+i:pos[x.tree]}}).sort(function(a,b){return a.k-b.k}).map(function(o){return o.x})}
 // Working is ordered by when you last wrote to each tree, newest first, so Claude's replies never shuffle it.
 function youAt(x){var m=SENT[x.tree];return Math.max(x.lastUserAt||0,m?m.at:0,LAST_SENT&&LAST_SENT.tree===x.tree?LAST_SENT.at:0)}
+// Whether a card's text overflows its clip is read once per frame for every changed card, not once per card.
+var CLIPQ=[];function clipCheck(cb){if(CLIPQ.push(cb)>1)return;requestAnimationFrame(function(){var q=CLIPQ;CLIPQ=[];q.forEach(function(c){c._over=c.scrollHeight>c.clientHeight+2});q.forEach(function(c){c.classList.toggle('over',c._over)})})}
 function syncPosts(container,items,parked,hold){if(container.id==='yt-list'&&!hold)items=manualSort(items);
   var keep={},act=hold?null:[].slice.call(container.children).find(function(el){var ta=el.querySelector('textarea');return ta&&(ta===document.activeElement||ta.value.trim())});
   if(act){var have={};[].slice.call(container.children).forEach(function(el){have[el.dataset.tree]=1});var old=[],fresh=[];items.forEach(function(x){(have[x.tree]?old:fresh).push(x)});
@@ -3589,7 +3599,7 @@ function syncPosts(container,items,parked,hold){if(container.id==='yt-list'&&!ho
     // never swap a card part out from under the pointer: a redraw between press and release eats the click
     if(main._h!==head&&!main.querySelector('.topicedit')&&!main.matches(':hover')){main._h=head;main.innerHTML=head}
     if(SENT[x.tree]&&LOCKH[x.tree]){le.classList.add('locked');le.style.height=LOCKH[x.tree]+'px'}else if(le.classList.contains('locked')){le.classList.remove('locked');le.style.height='';delete LOCKH[x.tree]}
-    if(le._h!==lat&&(!le.matches(':hover')&&!le.contains(document.activeElement)&&!selIn(le)||FORCE[x.tree])){delete FORCE[x.tree];var had=le._h;le._h=lat;le.innerHTML=lat;if(le.classList.contains('locked'))le.scrollTop=le.scrollHeight;var cb=le.querySelector('.clip');if(cb)cb.classList.toggle('over',cb.scrollHeight>cb.clientHeight+2);if(had&&CONVO===x.tree&&$('convo').open)soonChat(x.tree)}
+    if(le._h!==lat&&(!le.matches(':hover')&&!le.contains(document.activeElement)&&!selIn(le)||FORCE[x.tree])){delete FORCE[x.tree];var had=le._h;le._h=lat;le.innerHTML=lat;if(le.classList.contains('locked'))le.scrollTop=le.scrollHeight;var cb=le.querySelector('.clip');if(cb)clipCheck(cb);if(had&&CONVO===x.tree&&$('convo').open)soonChat(x.tree)}
   });
 }
 // After a card leaves (skip), bring the next one to the top of the feed. The scroll is worked out after the
@@ -3598,7 +3608,7 @@ function nextPostAfter(fromTree){var posts=[].slice.call(document.querySelectorA
 function scrollPostToTop(post){if(!post||!post.isConnected)return;var fs=document.querySelector('#yourturn .feedscroll');if(!fs)return;var top=-8,el=post;while(el&&el!==fs){top+=el.offsetTop;el=el.offsetParent}if(el!==fs)return;fs.scrollTo({top:Math.max(0,top),behavior:'smooth'});var ta=post.querySelector('textarea');if(ta)ta.focus({preventScroll:true})}
 function focusNextPost(fromTree){scrollPostToTop(nextPostAfter(fromTree))}
 function renderOverview(){
-  renderYourTurn();setTimeout(function(){document.querySelectorAll('#tiles .tile .s').forEach(function(el){if(el.scrollWidth>el.clientWidth+1)el.dataset.tip=el.textContent;else delete el.dataset.tip})},0);
+  renderYourTurn();requestAnimationFrame(function(){document.querySelectorAll('#tiles .tile .s').forEach(function(el){if(el.scrollWidth>el.clientWidth+1)el.dataset.tip=el.textContent;else delete el.dataset.tip})},0);
   var s=S.sys,p=pressure(),sp=s.swapTotalMB?s.swapUsedMB/s.swapTotalMB*100:0;
   var servers=S.servers.filter(function(x){return x.kind==='next'||x.kind==='metro'});
   var working=S.sessions.filter(function(x){return x.claudeState==='working'}).length,turn=S.sessions.filter(function(x){return sessState(x).cls==='waiting'&&!isCrew(x)}).length;
@@ -3900,7 +3910,7 @@ document.addEventListener('click',function(e){if(e.target.id==='lockgo')tryUnloc
 document.addEventListener('keydown',function(e){if(e.target.id==='lockpass'&&e.key==='Enter'){e.preventDefault();tryUnlock()}},true);
 // tell pebtree you are here (at most every 30s) so it does not auto-lock while you use it
 var LASTPING=0;['pointerdown','keydown','wheel','pointermove'].forEach(function(t){addEventListener(t,function(){if(LOCKED||Date.now()-LASTPING<30000)return;LASTPING=Date.now();act({op:'activity'})},{passive:true,capture:true})});
-function refresh(force){var wc=needCoarse()&&(force||Date.now()-coarseAt>60000);return fetch('/api/state'+(wc?'?coarse=1':'')).then(function(r){return r.json()}).then(function(d){if(d&&d.locked){showLock();return}if(LOCKED)hideLock();if(d.coarse){COARSE=d.coarse;coarseAt=Date.now()}S=d;maybeReload(d.build);$('live').style.background='var(--ok)';$('liveText').textContent='live';if(!S.loading)render()}).then(function(){FAILS=0},function(){FAILS++;var down=FAILS>=12;$('live').style.background=down?'var(--bad)':'var(--warn)';$('liveText').textContent=down?'pebtree is not running':'reconnecting…';if(!down)setTimeout(refresh,1000)})}
+function refresh(force){var wc=needCoarse()&&(force||Date.now()-coarseAt>60000);return fetch('/api/state'+(wc?'?coarse=1':'')).then(function(r){return r.json()}).then(function(d){if(d&&d.locked){showLock();return}if(LOCKED)hideLock();if(d.coarse){COARSE=d.coarse;coarseAt=Date.now()}S=d;maybeReload(d.build);$('live').style.background='var(--ok)';$('liveText').textContent='live';if(!S.loading)dataRender()}).then(function(){FAILS=0},function(){FAILS++;var down=FAILS>=12;$('live').style.background=down?'var(--bad)':'var(--warn)';$('liveText').textContent=down?'pebtree is not running':'reconnecting…';if(!down)setTimeout(refresh,1000)})}
 var FAILS=0;
 
 /* ---------- events ---------- */
@@ -4363,7 +4373,8 @@ function toggleFold(pn){var F;try{F=JSON.parse(lsGet('treehouse-folds')||'{}')}c
 function syncRanges(){document.querySelectorAll('.panel').forEach(function(pn){var t=pn.querySelector(':scope>.ptitle');if(!t)return;var c=pn.querySelector('.chart[id]');var rid=t.dataset.rid||(c&&c.id);if(!rid)return;var g=t.querySelector('.rseg');
   if(!g){var html='<div class="seg mini rseg" data-rid="'+rid+'" title="How far back this chart goes">'+['15m','1h','6h','24h'].map(function(r){return '<button data-cr="'+r+'">'+r+'</button>'}).join('')+'</div>';var mm=t.querySelector('.memMode');if(mm)mm.insertAdjacentHTML('beforebegin',html);else t.insertAdjacentHTML('beforeend',html);g=t.querySelector('.rseg')}
   var r=rangeOf(rid);g.querySelectorAll('button').forEach(function(b){b.classList.toggle('on',b.dataset.cr===r)});
-  g.style.visibility=(c&&!t.dataset.rid&&c.offsetParent===null)?'hidden':''})}
+  g.style.visibility=(c&&!t.dataset.rid&&!shown(c))?'hidden':''})}
+function shown(el){return !!el.closest('.view.on')&&!el.closest('.folded')}
 function syncSegs(){paintSide();syncFolds();syncRanges();syncSplitters();document.querySelectorAll('.seg').forEach(function(g){var bs=[].slice.call(g.querySelectorAll('button')),i=bs.findIndex(function(b){return b.classList.contains('on')});g.style.setProperty('--n',bs.length);if(i>=0)g.style.setProperty('--i',i);g.classList.toggle('has-on',i>=0)})}
 function markTheme(){var t=lsGet('devdeck-theme')||'auto';document.querySelectorAll('#theme button,#settings .seg button').forEach(function(b){b.classList.toggle('on',b.dataset.t===t)});syncSegs()}
 // Treehouse favicon in Nord colors; an orange dot appears while a session is waiting on you.
@@ -4379,13 +4390,16 @@ document.addEventListener('change',function(e){
 // The feed column fills the window from wherever it currently starts, so its last post is always reachable.
 // Every two-column layout gets a drag handle in its gap; each remembers its own split.
 function splitKey(g){var v=g.closest('.view'),all=v?[].slice.call(v.querySelectorAll('.cols2,.g2')):[];return 'treehouse-split:'+(v?v.id:'')+':'+all.indexOf(g)}
-function syncSplitters(){document.querySelectorAll('.view .cols2,.view .g2').forEach(function(g){if(!g.offsetParent)return;g.classList.add('rz');
+function syncSplitters(){document.querySelectorAll('.view .cols2,.view .g2').forEach(function(g){if(!shown(g))return;g.classList.add('rz');
   var f=+lsGet(splitKey(g))||0;g.style.setProperty('--split',f?(f*100).toFixed(2)+'%':'');
   var sp=[].slice.call(g.children).find(function(c){return c.classList.contains('splitter')});
   if(!sp){sp=document.createElement('div');sp.className='splitter';sp.title='Drag to resize · double-click to reset';g.appendChild(sp)}
   var first=[].slice.call(g.children).find(function(c){return !c.classList.contains('splitter')});
-  if(innerWidth<=1100||!first){sp.style.display='none';return}sp.style.display='';
-  var gap=parseFloat(getComputedStyle(g).columnGap)||12;sp.style.left=(first.offsetLeft+first.offsetWidth+gap/2-7)+'px'})}
+  if(innerWidth<=1100||!first){sp.style.display='none';return}var was=sp.style.display;sp.style.display='';g._sp=sp;
+  // the handle moves only when a column changes size, so a ResizeObserver places it after layout instead of every render measuring
+  if(!SPLIT_RO){placeSplit(g);return}if(!g._ro){g._ro=1;SPLIT_RO.observe(g)}if(g._first!==first){if(g._first)SPLIT_RO.unobserve(g._first);first._splitG=g;g._first=first;SPLIT_RO.observe(first)}else if(was==='none')placeSplit(g)})}
+var SPLIT_RO=window.ResizeObserver?new ResizeObserver(function(es){es.forEach(function(e){placeSplit(e.target._splitG||e.target)})}):null;
+function placeSplit(g){var sp=g._sp,first=g._first||[].slice.call(g.children).find(function(c){return !c.classList.contains('splitter')});if(!sp||!first||sp.style.display==='none')return;var gap=parseFloat(getComputedStyle(g).columnGap)||12;sp.style.left=(first.offsetLeft+first.offsetWidth+gap/2-7)+'px'}
 (function(){var raf=0;function later(){if(raf)return;raf=requestAnimationFrame(function(){raf=0;render()})}
   document.addEventListener('pointerdown',function(e){var sp=e.target.closest('.splitter');if(!sp)return;e.preventDefault();var g=sp.parentNode,key=splitKey(g);sp.classList.add('drag');document.body.classList.add('splitting');sp.setPointerCapture(e.pointerId);
     function mv(ev){var r=g.getBoundingClientRect(),f=Math.min(.75,Math.max(.25,(ev.clientX-r.left)/r.width));lsSet(key,f.toFixed(4));g.style.setProperty('--split',(f*100).toFixed(2)+'%');syncSplitters();later()}
@@ -4393,14 +4407,14 @@ function syncSplitters(){document.querySelectorAll('.view .cols2,.view .g2').for
     sp.addEventListener('pointermove',mv);sp.addEventListener('pointerup',up)});
   document.addEventListener('dblclick',function(e){var sp=e.target.closest('.splitter');if(sp){lsSet(splitKey(sp.parentNode),'');render()}});
   window.addEventListener('resize',function(){syncSplitters()})})();
-function sizeFeed(){var p=document.querySelector('#v-'+view+' .panes');if(!p||!p.offsetParent)return;if(innerWidth<=1100){p.style.height='';return}p.style.height=Math.max(360,innerHeight-p.getBoundingClientRect().top-window.scrollY*0-16)+'px'}
+function sizeFeed(){var p=document.querySelector('#v-'+view+' .panes');if(!p||!shown(p))return;if(innerWidth<=1100){if(p.style.height)p.style.height='';return}var hh=Math.max(360,innerHeight-p.getBoundingClientRect().top-16)+'px';if(p.style.height!==hh)p.style.height=hh}
 var sizeQueued=false;function queueSize(){if(sizeQueued)return;sizeQueued=true;requestAnimationFrame(function(){sizeQueued=false;sizeFeed()})}
-window.addEventListener('scroll',queueSize,{passive:true});window.addEventListener('resize',queueSize);setInterval(sizeFeed,1000);
+window.addEventListener('scroll',queueSize,{passive:true});window.addEventListener('resize',queueSize);setInterval(function(){if(!document.hidden)queueSize()},1000);
 window.addEventListener('hashchange',function(){setView(location.hash.slice(1));if(view==='proof')loadProof();if(view==='journal')loadJournal()});
 setInterval(function(){loadProof();if(view==='journal')loadJournal()},15000);loadProof();if(view==='journal')loadJournal();
 window.addEventListener('resize',function(){document.querySelectorAll('.chart').forEach(function(c){c._h=null});if(S&&!S.loading)render()});
 if(lsGet('devdeck-nav')==='collapsed')document.body.classList.add('collapsed');markTheme();setView(view);refresh(true).then(function(){var r=null;try{r=sessionStorage.getItem('pebtree-reopen');sessionStorage.removeItem('pebtree-reopen')}catch(e){}if(r&&S&&S.sessions&&S.sessions.some(function(q){return q.tree===r}))openConvo(r)});setInterval(refresh,15000);
-var RQ=0,CQ={};function soonRender(){if(RQ)return;RQ=setTimeout(function(){RQ=0;render()},150)}function soonChat(t){if(CQ[t])return;CQ[t]=setTimeout(function(){CQ[t]=0;reloadChat(t)},250)}
+var RQ=0,CQ={};function soonRender(){if(RQ)return;RQ=setTimeout(function(){RQ=0;dataRender()},150)}function soonChat(t){if(CQ[t])return;CQ[t]=setTimeout(function(){CQ[t]=0;reloadChat(t)},250)}
 (function(){var es,t=0;function open(){try{es=new EventSource('/api/events')}catch(e){return}
   es.onmessage=function(m){var ev;try{ev=JSON.parse(m.data)}catch(e){return}
     if(ev.type==='lock'){showLock();return}if(ev.type==='unlock'){if(LOCKED)hideLock();return}
