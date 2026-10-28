@@ -191,7 +191,7 @@ After a Claude Code or treehouse upgrade, `pebtree doctor` plus a look at the Fe
 | `hosts.<id>.ssh` | The ssh host to reach it by. `ssh <it>` must work without a prompt. The host needs Node 18+ and tmux (and treehouse and claude to start sessions there). |
 | `hosts.<id>.repoRoots` | Folders whose git checkouts the New session dialog offers (default `~/workspace`, `~` there; `~`, `~/Developer`, `~/src`, `~/code` here) |
 | `localHost` | This Mac's id in session ids (default `mac`) |
-| `claudeArgs` | Flags every Claude pebtree starts gets |
+| `claudeArgs` | Flags every Claude pebtree starts gets, here and on other hosts (not ticket spin-offs, which keep the default permission prompts) |
 | `presets` | One-click starts on the Terminals page and `pebtree new <id>`. `kind`: `tree` (Claude in a fresh treehouse worktree of `repo`), `claude`, `codex`, `shell` (with `session` it reuses that tmux session, like `tmux new -A`; `cmd` runs instead of a shell) |
 | `spinoff` | Where a spin-off with no session to come from goes |
 | `branchPrefix` | Prefix for spin-off branch names |

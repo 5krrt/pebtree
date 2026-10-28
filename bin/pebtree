@@ -539,8 +539,9 @@ async function spawnSession(spec) {
   fs.mkdirSync(LAUNCH_DIR, { recursive: true });
   let prompt = '';
   if (String(spec.prompt || '').trim()) { const pf = path.join(LAUNCH_DIR, `${Date.now()}-${rand}.md`); fs.writeFileSync(pf, String(spec.prompt)); prompt = ` "$(cat ${shq(pf)})"`; }
-  // a prompt written by someone else (a ticket) gets none of config.json's flags, only Claude's default permission prompts
-  const args = spec.untrusted ? ['--permission-mode', 'default'] : CLAUDE_ARGS;
+  // a prompt written by someone else (a ticket) gets none of config.json's flags, only Claude's default permission prompts;
+  // otherwise the dashboard's claudeArgs, which it sends along so another host needs no config.json of its own
+  const args = spec.untrusted ? ['--permission-mode', 'default'] : Array.isArray(spec.claudeArgs) ? spec.claudeArgs.map(String) : CLAUDE_ARGS;
   const claude = ['claude', ...args, ...(spec.title ? ['-n', String(spec.title).slice(0, 50)] : [])].map(shq).join(' ') + prompt;
   const shell = 'exec "${SHELL:-/bin/sh}" -l';
   const has = async (n) => (await runOk('tmux', ['has-session', '-t', `=${n}`], { timeout: 4000 })).ok;
@@ -1759,7 +1760,7 @@ async function startCaptain(objectives) {
   fs.mkdirSync(SPINOFF_DIR, { recursive: true });
   const pf = path.join(SPINOFF_DIR, `${id}.md`), launch = path.join(SPINOFF_DIR, `${id}.sh`);
   fs.writeFileSync(pf, prompt);
-  fs.writeFileSync(launch, `#!/bin/zsh -li\ncd ${JSON.stringify(treePath)} || exit 1\nclaude -n master --permission-mode auto "$(cat ${JSON.stringify(pf)})"\nexec zsh -l\n`, { mode: 0o755 });
+  fs.writeFileSync(launch, `#!/bin/zsh -li\ncd ${JSON.stringify(treePath)} || exit 1\nclaude -n master ${(CLAUDE_ARGS.length ? CLAUDE_ARGS : ['--permission-mode', 'auto']).map(shq).join(' ')} "$(cat ${JSON.stringify(pf)})"\nexec zsh -l\n`, { mode: 0o755 });
   // the indigo "Swarm Master" profile when it exists, else the default one
   const out = await run('osascript', ['-e', 'on run argv', '-e', 'tell application "iTerm2"', '-e', 'if (count of windows) = 0 then', '-e', 'create window with default profile command (item 1 of argv)', '-e', 'else', '-e', 'set w to current window',
     '-e', 'try', '-e', 'tell w to create tab with profile "Swarm Master" command (item 1 of argv)', '-e', 'on error', '-e', 'tell w to create tab with default profile command (item 1 of argv)', '-e', 'end try', '-e', 'end if', '-e', 'return "ok"', '-e', 'end tell', '-e', 'end run', `/bin/zsh -lic ${launch}`]);
@@ -1797,7 +1798,7 @@ Then do the task below, following the repo's CLAUDE.md. Commit on your branch; a
 ## Task
 ${task}
 `;
-  const r = await h.call('spawn', { kind: 'tree', repo: tgt.repo, prompt: brief, title, untrusted: !!untrusted }, 600000);
+  const r = await h.call('spawn', { kind: 'tree', repo: tgt.repo, prompt: brief, title, untrusted: !!untrusted, claudeArgs: CLAUDE_ARGS }, 600000);
   if (!r.ok) return r;
   const tree = `${h.id}:${path.basename(r.path)}:${r.tree}`;
   logAction({ op: 'spinoff', tree, label: title });
@@ -2216,7 +2217,7 @@ const server = http.createServer(async (req, res) => {
       if (a.op === 'spawn') {
         const h = HOSTS.get(String(a.host || LOCAL_HOST));
         if (!h) return send(res, 200, { ok: false, error: 'no such host' });
-        const r = await h.call('spawn', { kind: a.kind, repo: a.repo, prompt: a.prompt, title: a.title, session: a.session, cmd: a.cmd }, 600000).catch((e) => ({ ok: false, error: e.message }));
+        const r = await h.call('spawn', { kind: a.kind, repo: a.repo, prompt: a.prompt, title: a.title, session: a.session, cmd: a.cmd, claudeArgs: CLAUDE_ARGS }, 600000).catch((e) => ({ ok: false, error: e.message }));
         if (r.ok) logAction({ op: 'new', label: `${h.label}: ${r.session}` });
         return send(res, 200, { ...r, host: h.id });
       }
@@ -2224,7 +2225,7 @@ const server = http.createServer(async (req, res) => {
       if (a.op === 'resume-tree') {
         const t = slow.trees.get(String(a.tree || '')), h = t && HOSTS.get(t.host);
         if (!t || !h || !/^\d+$/.test(t.slot)) return send(res, 200, { ok: false, error: 'no such tree' });
-        const r = await h.call('spawn', { kind: 'resume', repo: t.path }, 60000).catch((e) => ({ ok: false, error: e.message }));
+        const r = await h.call('spawn', { kind: 'resume', repo: t.path, claudeArgs: CLAUDE_ARGS }, 60000).catch((e) => ({ ok: false, error: e.message }));
         if (r.ok) logAction({ op: 'resume', tree: t.tree, label: r.existed ? `reattached ${r.session}` : `Claude --continue in ${r.session}` });
         return send(res, 200, { ...r, host: h.id });
       }
