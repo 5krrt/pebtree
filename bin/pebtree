@@ -3454,6 +3454,11 @@ function sideHtml(x){
     sec('Actions','<div class="sdacts">'+(x.tty?'<button data-focus="'+x.tree+'" data-tip="Open its terminal">'+ICO.term+'</button>':'')+(x.tty&&!x.remote?'<button data-remote="'+x.tree+'" data-tip="Make remote · reach it from claude.ai or your phone">'+ICO.remote+'</button>':'')+'<button data-pin="'+x.tree+'" data-tip="'+(PINS[x.tree]?'Unpin from the top of the feed':'Pin to the top of the feed')+'"'+(PINS[x.tree]?' class="on"':'')+'><svg viewBox="0 0 24 24"><path d="M9 4h6l-1 6 4 4H6l4-4zM12 14v7"/></svg></button><button data-movemenu="'+x.tree+'" data-tip="Move to another section of the feed"><svg viewBox="0 0 24 24"><path d="M7 4v16M7 20l-3-3M7 20l3-3M17 20V4M17 4l-3 3M17 4l3 3"/></svg></button>'+(svcs.some(function(v){return v.killable})?'<button class="danger" data-stoptree="'+x.tree+'" data-tip="Stop its dev servers, Metro, Jest and stray node processes. Claude keeps running.">'+ICO.stop+'</button>':'')+(x.tree!=='main'?'<button class="danger" data-closetree="'+x.tree+'" data-tip="Close tree: stop everything, end its Claude session, close its tab, return the tree">'+ICO.close+'</button>':'')+'</div>');
 }
 var LIVE_T=0,LIVEV={on:false,html:'',draft:false,dhtml:''};
+var CVHOLD=0;function selIn(el){var s=window.getSelection();return !!(s&&!s.isCollapsed&&s.rangeCount&&el.contains(s.getRangeAt(0).commonAncestorContainer))}
+function cvCatchUp(){var l=$('cvlog');if(l&&l._stale&&!CVHOLD&&!selIn(l)&&$('convo').open)paintConvo(false)}
+document.addEventListener('pointerdown',function(e){if(e.target.closest&&e.target.closest('#cvlog'))CVHOLD=1},true);
+['pointerup','pointercancel'].forEach(function(t){document.addEventListener(t,function(){if(CVHOLD){CVHOLD=0;setTimeout(cvCatchUp,0)}},true)});
+document.addEventListener('selectionchange',function(){if(!CVHOLD)cvCatchUp()});
 function reloadChat(tree){var h=CHAT[tree];fetch('/api/chat?tree='+encodeURIComponent(tree)+'&limit=200').then(function(r){return r.json()}).then(function(d){if(CONVO!==tree||!$('convo').open)return;var log=document.querySelector('#convo .cvlog'),atBottom=!log||log.scrollHeight-log.scrollTop-log.clientHeight<40;var add=(d.items||[]).length-h.items.length;h.items=d.items||[];if(add>0)h.n=Math.min(h.items.length,h.n+add);paintConvo(atBottom,!atBottom)})}
 function pollLive(){clearTimeout(LIVE_T);if(!CONVO||!$('convo').open)return;var tree=CONVO;
   fetch('/api/live?tree='+encodeURIComponent(tree)).then(function(r){return r.json()}).then(function(v){if(CONVO!==tree)return;var h=CHAT[tree];
@@ -3484,7 +3489,10 @@ function paintConvo(toBottom,keepTop,prepend){var tree=CONVO,x=S.sessions.find(f
   var hd=$('cvhead');if(hd._h!==headH&&(FORCEHEAD||!hd.matches(':hover')&&!hd.querySelector('.topicedit'))){hd._h=headH;hd.innerHTML=headH}FORCEHEAD=false;
   if(SUBVIEW&&SUBVIEW.tree===tree)logH=subLogH();
   if($('cvlog')&&$('cvlog').contains(document.activeElement)&&!FORCE[tree]&&!toBottom){syncJump();return} // you are typing in a box inside the conversation
-  var nl=$('cvlog'),oldTop=nl.scrollTop;nl.innerHTML=logH;nl.scrollTop=toBottom?nl.scrollHeight:keepTop?oldTop:nl.scrollHeight-off;if(keepTop&&nl.scrollHeight>oldH+4)NEWBELOW=true;syncJump()}
+  var nl=$('cvlog');if(nl._h===logH){syncJump();return}
+  // never redraw under a selection or a press: it drops what you are copying and eats the click on a link
+  if(!FORCE[tree]&&(CVHOLD||selIn(nl))){nl._stale=1;syncJump();return}
+  var oldTop=nl.scrollTop;nl._h=logH;nl._stale=0;nl.innerHTML=logH;nl.scrollTop=toBottom?nl.scrollHeight:keepTop?oldTop:nl.scrollHeight-off;if(keepTop&&nl.scrollHeight>oldH+4)NEWBELOW=true;syncJump()}
 var NEWBELOW=false;
 function syncJump(){var l=$('cvlog'),b=$('cvjump');if(!l||!b)return;var away=l.scrollHeight-l.scrollTop-l.clientHeight;if(away<40)NEWBELOW=false;b.classList.toggle('on',away>120||NEWBELOW&&away>=40);b.classList.toggle('new',NEWBELOW);var t=NEWBELOW?'↓ New messages':'↓ Latest';if(b.textContent!==t)b.textContent=t}
 function postComposer(x){
@@ -3581,7 +3589,7 @@ function syncPosts(container,items,parked,hold){if(container.id==='yt-list'&&!ho
     // never swap a card part out from under the pointer: a redraw between press and release eats the click
     if(main._h!==head&&!main.querySelector('.topicedit')&&!main.matches(':hover')){main._h=head;main.innerHTML=head}
     if(SENT[x.tree]&&LOCKH[x.tree]){le.classList.add('locked');le.style.height=LOCKH[x.tree]+'px'}else if(le.classList.contains('locked')){le.classList.remove('locked');le.style.height='';delete LOCKH[x.tree]}
-    if(le._h!==lat&&(!le.matches(':hover')&&!le.contains(document.activeElement)||FORCE[x.tree])){delete FORCE[x.tree];var had=le._h;le._h=lat;le.innerHTML=lat;if(le.classList.contains('locked'))le.scrollTop=le.scrollHeight;var cb=le.querySelector('.clip');if(cb)cb.classList.toggle('over',cb.scrollHeight>cb.clientHeight+2);if(had&&CONVO===x.tree&&$('convo').open)soonChat(x.tree)}
+    if(le._h!==lat&&(!le.matches(':hover')&&!le.contains(document.activeElement)&&!selIn(le)||FORCE[x.tree])){delete FORCE[x.tree];var had=le._h;le._h=lat;le.innerHTML=lat;if(le.classList.contains('locked'))le.scrollTop=le.scrollHeight;var cb=le.querySelector('.clip');if(cb)cb.classList.toggle('over',cb.scrollHeight>cb.clientHeight+2);if(had&&CONVO===x.tree&&$('convo').open)soonChat(x.tree)}
   });
 }
 // After a card leaves (skip), bring the next one to the top of the feed. The scroll is worked out after the
@@ -3903,7 +3911,8 @@ document.addEventListener('click',function(e){
   if(e.target.closest('#cvjump')){var lj=$('cvlog');if(lj)lj.scrollTo({top:lj.scrollHeight,behavior:'smooth'});return}
   if(e.target.closest('#updbtn')){doReload();return}
   var cc=e.target.closest('[data-codecopy]');if(cc){var pre=cc.parentNode.querySelector('pre'),tx=pre?pre.textContent:'';(navigator.clipboard?navigator.clipboard.writeText(tx):Promise.reject()).then(function(){var o=cc.textContent;cc.textContent='Copied';cc.classList.add('done');setTimeout(function(){cc.textContent=o;cc.classList.remove('done')},1400)},function(){toast('Copy failed')});return}
-  var cv=e.target.closest('[data-convo]');if(cv&&!window.getSelection().toString()){openConvo(cv.dataset.convo);return}
+  // a link or a path inside a card does its own thing; a button opens even while some text is still selected
+  var cv=e.target.closest('[data-convo]');if(cv&&!e.target.closest('a,[data-fpath]')&&(cv.tagName==='BUTTON'||!window.getSelection().toString())){openConvo(cv.dataset.convo);return}
   var mo=e.target.closest('[data-more]');if(mo){var hh=CHAT[mo.dataset.more];hh.n=Math.min(hh.items.length,hh.n+15);paintConvo(false,false,true);return}
   if(e.target.closest('[data-closeconvo]')||e.target===$('convo')){$('convo').close();return}
   var cp=e.target.closest('[data-copy]');if(cp){var tx=cp.dataset.copy;(navigator.clipboard?navigator.clipboard.writeText(tx):Promise.reject()).then(function(){toast('Copied '+tx)},function(){toast('Copy failed: '+tx)});return}
