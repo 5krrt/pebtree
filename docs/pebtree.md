@@ -27,11 +27,13 @@ This document is the contract for running it anywhere: what it needs, how to set
 |---|---|---|
 | macOS | Memory, swap and process stats come from macOS tools | Does not run |
 | Node 18 or newer | Runs the server | Does not run |
-| iTerm2, with your Claude sessions in iTerm2 tabs | Tab titles tell it which sessions are working or waiting; replies are typed into the tab | No states, no replies |
+| tmux, here and on every host | Sessions pebtree starts run in it; titles and screens are read from it, replies typed into it | Only iTerm2 sessions are followed |
+| python3 | Gives the page's terminals a pty | No terminals in the page |
+| iTerm2 (optional) | Sessions already in iTerm2 tabs are followed | Those sessions are not shown |
 | Automation permission for iTerm2 | AppleScript reads and writes the tabs | Same as above |
 | Claude Code | Session transcripts in `~/.claude/projects` are the source of every message shown | Empty feed |
 | [treehouse](#treehouse) | The worktree pool: which trees exist and which session uses which | No trees |
-| A GitHub `origin` and `npx` | PR status via `npx -y gh-axi` | PRs show without status |
+| `gh`, logged in | PR status for every repo the trees belong to | PRs show without status |
 | A teardown command (optional, `teardown` in config.json) | Close tree stops a tree's dev servers first | Close tree skips that step |
 | The `/daily-standup` skill (or your own) | Writes journal entries | Journal tab only |
 | `send-proof` and `spinoff` skills (optional) | Let sessions send you proof and spin tasks off to new trees | Those features stay manual |
@@ -164,6 +166,59 @@ When one of these changes, the matching feature breaks; this table says where to
 | Captain decisions | `~/.claude/swarm/decisions.json`: `{ decisions: [{ id, status, worker, title, why, context, options: [{ label, reply, recommended }] }] }` | `readDecisions` |
 
 After a Claude Code or treehouse upgrade, `pebtree doctor` plus a look at the Feed and one detail view is the smoke test.
+
+## Hosts and tmux (this fork)
+
+`~/.config/pebtree/config.json` (only `hosts` is needed for another machine; the rest is optional):
+
+```json
+{
+  "localHost": "mac",
+  "hosts": { "mininav": { "ssh": "mininav", "label": "mininav", "repoRoots": ["~/workspace"] } },
+  "claudeArgs": ["--dangerously-skip-permissions"],
+  "branchPrefix": "arnav/",
+  "presets": [
+    { "id": "tw", "label": "Ditto worktree", "host": "mininav", "kind": "tree", "repo": "~/workspace/cbc-ditto" },
+    { "id": "cx", "label": "Codex workspace", "host": "mininav", "kind": "shell", "session": "codex", "repo": "~/workspace" },
+    { "id": "hx", "label": "Hermes shell", "host": "mininav", "kind": "shell", "session": "hermes", "repo": "~/workspace/cbc-ditto", "cmd": "~/bin/hermes-shell" }
+  ],
+  "spinoff": { "host": "mininav", "repo": "~/workspace/cbc-ditto" }
+}
+```
+
+| Key | Meaning |
+|---|---|
+| `hosts.<id>.ssh` | The ssh host to reach it by. `ssh <it>` must work without a prompt. The host needs Node 18+ and tmux (and treehouse and claude to start sessions there). |
+| `hosts.<id>.repoRoots` | Folders whose git checkouts the New session dialog offers (default `~/workspace`, `~` there; `~`, `~/Developer`, `~/src`, `~/code` here) |
+| `localHost` | This Mac's id in session ids (default `mac`) |
+| `claudeArgs` | Flags every Claude pebtree starts gets |
+| `presets` | One-click starts on the Terminals page and `pebtree new <id>`. `kind`: `tree` (Claude in a fresh treehouse worktree of `repo`), `claude`, `codex`, `shell` (with `session` it reuses that tmux session, like `tmux new -A`; `cmd` runs instead of a shell) |
+| `spinoff` | Where a spin-off with no session to come from goes |
+| `branchPrefix` | Prefix for spin-off branch names |
+
+**Ids.** Every tree and session is `<host>:<repo>:<slot>`: a treehouse slot number, `main` for a checkout, `dir` for any other
+folder (`mininav:cbc-ditto:24`, `mac:CatchBack:main`). The page shows them as "cbc-ditto 24 · mininav".
+
+**The agent.** On connect pebtree compares a hash of itself with `~/.local/share/pebtree/sha` on the host and copies itself over
+when they differ, then runs `node ~/.local/share/pebtree/pebtree agent` over one ssh connection: one JSON request per line on stdin,
+one answer per line on stdout (`AGENT_OPS` in the code). It reconnects with backoff when the connection drops; sessions there
+keep running in tmux meanwhile.
+
+**Sessions it starts.** Each runs in its own detached tmux session from a script in `~/.local/share/pebtree/launch/` on its host:
+`tw-<repo>-<N>` for a worktree (the same contract as `tw`: when Claude exits or the session is killed the worktree goes back to the
+pool, and treehouse keeps it leased while it has uncommitted changes), `cl-…`, `cx-…`, `sh-…` otherwise.
+
+**Stale trees.** A pool slot treehouse has leased (v3) or that has a live owner (v2), with no Claude process in it, is listed on the
+Terminals page under "Where you left off". Attach opens the tmux session still in it; Resume starts `claude --continue` there
+(plain `claude` if it never had a conversation); Return runs `treehouse return --force` after checking for uncommitted changes.
+
+**Terminals in the page** need python3 on this Mac (it gives `tmux attach`, or `ssh -tt <host> tmux attach`, a pty). xterm.js is
+fetched once from jsDelivr, checked against pinned SHA-256 hashes, and kept in `~/.config/pebtree/vendor/`.
+
+**PRs** come from `gh pr list -R <owner/repo>` for every repo a tree belongs to, and `gh pr view` for merge state.
+
+**Without iTerm2.** Sessions in iTerm2 tabs are still followed (read and typed into with AppleScript); everything started from the
+dashboard lives in tmux instead.
 
 ## Security
 

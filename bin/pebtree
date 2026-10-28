@@ -3,7 +3,13 @@
 // uses, every dev process (Next, Metro/Expo, Jest, MCP) with its real memory, the Mac's
 // memory/swap/CPU over time, the swarm captain's board, and stop/throttle/cleanup controls.
 //
+// This fork follows Claude sessions on this Mac and on other machines over ssh (config.json "hosts"),
+// in iTerm2 tabs or tmux, and starts new ones (a fresh treehouse worktree, a checkout, Codex, a shell)
+// in tmux, with a terminal for each right in the page.
+//
 // Usage: pebtree [--port 4777]      then open http://localhost:4777
+//        pebtree new <preset> | <host> <kind> [repo] [--prompt "..."]   start a session (kinds: tree, claude, codex, shell)
+//        pebtree agent                                 what runs on each ssh host; spoken to over stdin/stdout
 //        pebtree init [--main <repo>] [--pool <dir>]   write ~/.config/pebtree/config.json for this machine
 //        pebtree doctor                                check every dependency and say how to fix what is missing
 //        pebtree tickets-key [url]                     save the tickets API key from the clipboard into config.json
@@ -18,9 +24,13 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
-const { execFile } = require('child_process');
+const { execFile, spawn } = require('child_process');
 
 const HOME = os.homedir();
+const AGENT = process.argv[2] === 'agent'; // running on another host for the dashboard, over ssh
+// tmux, treehouse, claude and codex live in these, whatever started pebtree (a LaunchAgent, ssh without a login shell)
+process.env.PATH = [...new Set([path.join(HOME, '.local/bin'), path.join(HOME, 'bin'), '/opt/homebrew/bin', '/usr/local/bin', ...(process.env.PATH || '/usr/bin:/bin').split(':')])].join(':');
+if (!/utf-?8/i.test(process.env.LANG || '')) process.env.LANG = process.platform === 'darwin' ? 'en_US.UTF-8' : 'C.UTF-8'; // tmux draws ✳ and box lines as _ without it
 const CONF_DIR = path.join(HOME, '.config/pebtree');
 // Per-machine setup lives in ~/.config/pebtree/config.json (written by `pebtree init`; see docs/pebtree.md).
 // Env vars override it. Without either, `pebtree init` has to be run first.
@@ -33,6 +43,8 @@ const REPO_DIR = CONFIG.repoDir || (MAIN ? path.basename(MAIN) : ''); // the che
 // stops a tree's dev servers before it is returned; by default treehouse-dev's teardown when it is installed, else nothing
 const TEARDOWN = CONFIG.teardown !== undefined ? CONFIG.teardown : ((process.env.PATH || '').split(':').some((d) => d && fs.existsSync(path.join(d, 'treehouse-dev'))) ? 'treehouse-dev teardown {tree}' : '');
 const JOURNAL_SKILL = CONFIG.journalSkill || '/daily-standup';
+const LOCAL_HOST = CONFIG.localHost || 'mac'; // this Mac's id in session ids; others come from config.json "hosts"
+const CLAUDE_ARGS = Array.isArray(CONFIG.claudeArgs) ? CONFIG.claudeArgs.map(String) : ['--dangerously-skip-permissions']; // what sessions pebtree starts run with
 const SWARM = path.join(HOME, '.claude/swarm');
 const SETTINGS_FILE = path.join(CONF_DIR, 'settings.json');
 const UI_FILE = path.join(CONF_DIR, 'ui.json'); // page layout prefs (splits, ranges, font...) so every browser and window gets the same layout
@@ -40,7 +52,7 @@ const TITLES_FILE = path.join(CONF_DIR, 'titles.json'); // names you gave sessio
 const LOG_FILE = path.join(CONF_DIR, 'actions.jsonl');
 const PORT = Number((process.argv.find((a, i) => process.argv[i - 1] === '--port')) || 4777);
 // Kept across restarts (owner-only file) so open tabs keep working; it only stops other sites from posting actions.
-const TOKEN = (() => {
+const TOKEN = AGENT ? '' : (() => {
   const f = path.join(os.homedir(), '.config/pebtree/token');
   try { const t = fs.readFileSync(f, 'utf8').trim(); if (/^[0-9a-f]{32}$/.test(t)) return t; } catch { /* first run */ }
   const t = crypto.randomBytes(16).toString('hex');
@@ -83,14 +95,16 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ---------- process model ----------
 
+// Which tree a path on this Mac belongs to: a slot of any treehouse pool (<host>:<repo>:<N>), or a checkout a
+// session runs in (<host>:<repo>:main). Ids are the same strings sessions are keyed by everywhere.
+const POOL_RE = /\/\.treehouse\/([^/\s]+)\/(\d+)\/([^/\s]+)(?=\/|\s|$)/;
+let LOCAL_TOPS = []; // git checkouts local sessions run in, longest first
 function treeOf(cwd) {
   if (!cwd) return null;
-  if (cwd.startsWith(POOL + '/')) {
-    const m = cwd.slice(POOL.length + 1).match(/^(\d+)\//) || cwd.slice(POOL.length + 1).match(/^(\d+)$/);
-    return m ? m[1] : null;
-  }
-  if (cwd === MAIN || cwd.startsWith(MAIN + '/')) return 'main';
-  return null;
+  const m = cwd.match(POOL_RE);
+  if (m) return `${LOCAL_HOST}:${m[3]}:${m[2]}`;
+  const top = LOCAL_TOPS.find((t) => cwd === t || cwd.startsWith(t + '/'));
+  return top ? `${LOCAL_HOST}:${path.basename(top)}:main` : null;
 }
 
 function kindOf(args, comm) {
@@ -128,7 +142,7 @@ async function readProcesses() {
     const m = line.match(/^\s*(\d+)\s+(\d+)\s+(\d+)\s+([\d.]+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(.*)$/);
     if (!m) continue;
     const comm = path.basename(m[7]);
-    procs.set(+m[1], { pid: +m[1], ppid: +m[2], rssMB: +m[3] / 1024, cpu: +m[4], age: etimeSeconds(m[5]), tty: m[6] === '??' ? null : m[6], comm, args: m[8].trim() });
+    procs.set(+m[1], { pid: +m[1], ppid: +m[2], rssMB: +m[3] / 1024, cpu: +m[4], age: etimeSeconds(m[5]), tty: m[6] === '??' || m[6] === '?' ? null : m[6], comm, args: m[8].trim() });
   }
   return procs;
 }
@@ -136,6 +150,7 @@ async function readProcesses() {
 async function readCwds(pids) {
   const cwds = new Map();
   if (!pids.length) return cwds;
+  if (process.platform === 'linux') { for (const pid of pids) try { cwds.set(pid, fs.readlinkSync(`/proc/${pid}/cwd`)); } catch { /* gone, or not ours */ } return cwds; }
   const out = await run('lsof', ['-a', '-d', 'cwd', '-p', pids.join(','), '-Fpn']);
   let pid = null;
   for (const line of out.split('\n')) {
@@ -190,13 +205,14 @@ async function readSwapAndPressure() {
 
 const tabNames = new Map(), TABSEEN = new Map(); // tty -> { name, since }: when a hand-set tab name last changed
 // The name shown for a session: whichever was set last, a name you gave it in pebtree or one you typed on its iTerm tab.
-function pickTitle(claude, title) {
-  if (!claude) return { title: cleanTitle(title), customTitle: false, tabNamed: false };
-  const ct = customTitles[claude.id], ctName = typeof ct === 'string' ? ct : ct && ct.name, ctAt = ct && typeof ct === 'object' ? ct.at : 0;
-  const tab = claude.tty && tabNames.get(claude.tty), tabSince = (claude.tty && TABSEEN.get(claude.tty) || {}).since || 0;
+// c: { id: '<host>:<pid>', tabName, tabSince, name (one Claude Code was given with /rename or -n) }
+function pickTitle(c, title) {
+  if (!c) return { title: cleanTitle(title), customTitle: false, tabNamed: false };
+  const ct = customTitles[c.id], ctName = typeof ct === 'string' ? ct : ct && ct.name, ctAt = ct && typeof ct === 'object' ? ct.at : 0;
+  const tab = c.tabName, tabSince = c.tabSince || 0;
   if (ctName && (!tab || ctAt >= tabSince)) return { title: ctName, customTitle: true, tabNamed: false };
   if (tab) return { title: tab, customTitle: !!ctName, tabNamed: true };
-  return { title: ctName || cleanTitle(title), customTitle: !!ctName, tabNamed: false };
+  return { title: ctName || cleanTitle(title) || c.name || '', customTitle: !!ctName, tabNamed: false };
 }
 let lastTitles = new Map();
 async function readItermTitles() {
@@ -207,7 +223,12 @@ async function readItermTitles() {
       repeat with t in tabs of w
         repeat with s in sessions of t
           try
-            set out to out & (tty of s) & (ASCII character 9) & (name of s) & (ASCII character 9) & (title of t) & linefeed
+            set tabTitle to ""
+            -- not every iTerm version has a tab title; without this the whole row was dropped
+            try
+              set tabTitle to (title of t)
+            end try
+            set out to out & (tty of s) & (ASCII character 9) & (name of s) & (ASCII character 9) & tabTitle & linefeed
           end try
         end repeat
       end repeat
@@ -239,7 +260,7 @@ function claudeStateFromTitle(title) {
   return 'unknown';
 }
 function cleanTitle(title) {
-  return (title || '').replace(/^[✳⠀-⣿◐-◓]\s*/, '').replace(/\s*\((node|claude|zsh|-zsh)\)\s*$/, '').trim();
+  return (title || '').replace(/^[✳⠀-⣿◐-◓]\s*/, '').replace(/\s*\((node|claude|zsh|-zsh|bash|python|ssh|tmux)\)\s*$/, '').trim();
 }
 
 // Groups attributed processes into services: a service is the topmost ancestor chain in the
@@ -250,7 +271,7 @@ function buildServices(procs, cwds, listeners, foot) {
   for (const p of procs.values()) {
     const kind = kindOf(p.args, p.comm);
     if (!kind || p.pid === process.pid) continue;
-    const tree = treeOf(cwds.get(p.pid)) || treeOf((p.args.match(new RegExp(escapeRe(POOL) + '/\\d+/[^\\s]*')) || [])[0]);
+    const tree = treeOf(cwds.get(p.pid)) || treeOf((p.args.match(/\S*\/\.treehouse\/[^/\s]+\/\d+\/[^/\s]+/) || [])[0]);
     if (!tree) continue;
     attributed.set(p.pid, { ...p, kind, tree, memMB: foot.get(p.pid) ?? p.rssMB });
   }
@@ -314,33 +335,452 @@ function labelFor(s) {
 }
 function escapeRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
+// ---------- hosts and terminals ----------
+// Every host answers the same questions (AGENT_OPS below): this Mac in-process, every other one through
+// `pebtree agent`, this same file run there over one long-lived ssh connection. A session lives in a tmux pane
+// (addressed by pane id, on any host) or an iTerm2 tab (by tty, this Mac only).
+
+const SAFE_NAME = /^[\w.@-]{1,80}$/; // tmux session names pebtree attaches to or kills
+function runOk(cmd, args, opts = {}) {
+  const { input, ...o } = opts;
+  return new Promise((resolve) => {
+    const c = execFile(cmd, args, { maxBuffer: 32 * 1024 * 1024, timeout: 20000, ...o }, (err, stdout, stderr) => resolve({ ok: !err, out: String(stdout || ''), err: err ? (String(stderr || '').trim() || err.message) : '' }));
+    if (c.stdin) { c.stdin.on('error', () => {}); if (input != null) c.stdin.end(input); }
+  });
+}
+const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+
+const TMUX_F = ['pane_id', 'pane_tty', 'pane_pid', 'session_name', 'window_index', 'session_attached', 'session_activity', 'pane_current_command', 'pane_current_path', 'pane_title', 'session_windows', 'window_active', 'pane_active'];
+async function readTmuxPanes() {
+  const r = await runOk('tmux', ['list-panes', '-a', '-F', TMUX_F.map((f) => `#{${f}}`).join('\t')], { timeout: 5000 });
+  if (!r.ok) return []; // no tmux server running
+  const panes = [];
+  for (const line of r.out.split('\n')) {
+    const v = line.split('\t');
+    if (v.length < TMUX_F.length) continue;
+    panes.push({ pane: v[0], tty: v[1].replace('/dev/', ''), pid: +v[2], session: v[3], window: +v[4], attached: +v[5], activity: +v[6] * 1000, cmd: v[7], cwd: v[8], title: v[9], windows: +v[10], active: v[11] === '1' && v[12] === '1' });
+  }
+  return panes;
+}
+// One row per tmux session for the Terminals page. A window linked into several sessions (the `codex` session
+// holds a window of each tw-* one) counts in each, but its Claude belongs to the tw-* one.
+function tmuxSessions(panes, claudePanes) {
+  const by = new Map();
+  for (const p of panes) {
+    let s = by.get(p.session);
+    if (!s) by.set(p.session, (s = { session: p.session, windows: p.windows, attached: p.attached, activity: p.activity, claude: 0, cmd: p.cmd, cwd: p.cwd, title: p.title }));
+    if (claudePanes.get(p.pane) === p.session) s.claude++;
+    if (p.active) Object.assign(s, { cmd: p.cmd, cwd: p.cwd, title: p.title });
+  }
+  return [...by.values()].sort((a, b) => b.activity - a.activity);
+}
+
+// treehouse keeps each pool's slots in ~/.treehouse/<pool>/treehouse-state.json: v3 marks a lease, v2 an owner pid.
+function readPools() {
+  const root = path.join(HOME, '.treehouse'), out = [];
+  let dirs = []; try { dirs = fs.readdirSync(root, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name); } catch { return out; }
+  const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
+  for (const d of dirs) {
+    const st = readJson(path.join(root, d, 'treehouse-state.json'), null);
+    for (const w of (st && st.worktrees) || []) {
+      if (!w || !w.path || !/^\d+$/.test(String(w.name))) continue;
+      out.push({ pool: d, slot: String(w.name), path: w.path, repo: path.basename(w.path), status: w.leased ? 'leased' : w.owner_pid && alive(w.owner_pid) ? 'in-use' : 'available', holder: w.lease_holder || '' });
+    }
+  }
+  return out;
+}
+
+const topCache = new Map(), gitCache = new Map();
+async function gitTop(dir) {
+  if (!dir) return '';
+  const hit = topCache.get(dir);
+  if (hit && Date.now() - hit.at < 300000) return hit.top;
+  const top = (await run('git', ['-C', dir, 'rev-parse', '--show-toplevel'], { timeout: 5000 })).trim();
+  topCache.set(dir, { top, at: Date.now() });
+  return top;
+}
+// Branch, uncommitted files, commits ahead of the default branch, upstream and GitHub slug; re-read every 15s.
+async function gitInfoCached(dir) {
+  const hit = gitCache.get(dir);
+  if (hit && Date.now() - hit.at < 15000) return hit.v;
+  const base = (hit && hit.v.base) || (await run('git', ['-C', dir, 'symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], { timeout: 5000 })).trim() || 'origin/master';
+  const [branch, status, ahead, upstream, origin] = await Promise.all([
+    run('git', ['-C', dir, 'branch', '--show-current']),
+    run('git', ['-C', dir, 'status', '--porcelain']),
+    run('git', ['-C', dir, 'rev-list', '--count', `${base}..HEAD`]),
+    run('git', ['-C', dir, 'rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}']),
+    run('git', ['-C', dir, 'remote', 'get-url', 'origin']),
+  ]);
+  const v = { branch: branch.trim() || '(detached)', dirty: status.split('\n').filter(Boolean).length, ahead: +ahead.trim() || 0, upstream: upstream.trim(), base, slug: (origin.trim().match(/github[\w.-]*[:/]([\w.-]+\/[\w.-]+?)(\.git)?\/?$/) || [])[1] || '' };
+  gitCache.set(dir, { v, at: Date.now() });
+  return v;
+}
+const dropCache = new Map();
+async function dropsCached(dir) {
+  const hit = dropCache.get(dir);
+  if (hit && Date.now() - hit.at < 15000) return hit.v;
+  const v = dir ? await dropsFor(dir) : [];
+  dropCache.set(dir, { v, at: Date.now() });
+  return v;
+}
+function sysStats() {
+  const s = { totalMB: os.totalmem() / 1048576, usedMB: (os.totalmem() - os.freemem()) / 1048576, load: os.loadavg(), cores: os.cpus().length };
+  try { const mi = fs.readFileSync('/proc/meminfo', 'utf8'), g = (k) => +((mi.match(new RegExp('^' + k + ':\\s+(\\d+)', 'm')) || [])[1] || 0) / 1024; if (g('MemAvailable')) s.usedMB = g('MemTotal') - g('MemAvailable'); } catch { /* not Linux */ }
+  return s;
+}
+function sessionFile(cwd, sessionId) {
+  const f = path.join(HOME, '.claude/projects', cwd.replace(/[/.]/g, '-'), `${sessionId}.jsonl`);
+  return fs.existsSync(f) ? f : null;
+}
+
+// Every interactive Claude Code session on this host, with its terminal, checkout, git state and transcript.
+// pre: what the dashboard already read this cycle on its own Mac (processes, cwds, iTerm titles).
+// known: pid -> transcript rev the caller already has; those transcripts are left out.
+const CLAUDE_SKIP = /\bbg-(spare|pty-host)\b|\bdaemon\b|--chrome-native-host|(^|\s)(-p|--print)(\s|$)/;
+async function scanHost(pre = {}) {
+  const procs = pre.procs || await readProcesses();
+  const claudes = [...procs.values()].filter((p) => p.tty && kindOf(p.args, p.comm) === 'claude' && !CLAUDE_SKIP.test(p.args));
+  const [cwds, panes, titles] = await Promise.all([pre.cwds || readCwds(claudes.map((p) => p.pid)), readTmuxPanes(), pre.titles || (process.platform === 'darwin' ? readItermTitles() : new Map())]);
+  // a pane shown in several sessions (linked windows) is addressed through its own tw-* session
+  const rank = (p) => (/^(tw|cl|cx|sh)-/.test(p.session) ? 0 : 1000) + p.windows;
+  const byTty = new Map();
+  for (const p of panes) { const cur = byTty.get(p.tty); if (!cur || rank(p) < rank(cur)) byTty.set(p.tty, p); }
+  const known = pre.known || {};
+  const sessions = (await Promise.all(claudes.map(async (p) => {
+    const rec = readJson(path.join(HOME, '.claude/sessions', `${p.pid}.json`), null);
+    if (rec && rec.kind && rec.kind !== 'interactive') return null;
+    if (procs.get(p.ppid) && kindOf(procs.get(p.ppid).args, procs.get(p.ppid).comm) === 'claude') return null; // a claude another one runs
+    const cwd = (rec && rec.cwd) || cwds.get(p.pid) || '';
+    if (!cwd) return null;
+    const pane = byTty.get(p.tty), iterm = !pane && titles.has(p.tty);
+    const top = await gitTop(cwd), git = top ? await gitInfoCached(top) : null;
+    const tfile = rec && rec.sessionId ? sessionFile(cwd, rec.sessionId) : null;
+    const tr = transcriptInfoCached(cwd, tfile, git && git.slug);
+    const m = cwd.match(POOL_RE);
+    const s = {
+      pid: p.pid, cwd, top, tty: p.tty, args: p.args, memMB: p.rssMB, cpu: p.cpu, age: p.age,
+      status: (rec && rec.status) || '', name: rec && rec.nameSource !== 'derived' ? rec.name || '' : '',
+      term: pane ? 'tmux' : iterm ? 'iterm' : '', pane: pane ? pane.pane : '', session: pane ? pane.session : '', attached: pane ? pane.attached : 0,
+      title: pane ? pane.title : iterm ? titles.get(p.tty) : '', tabName: iterm ? tabNames.get(p.tty) || '' : '', tabSince: iterm ? (TABSEEN.get(p.tty) || {}).since || 0 : 0,
+      pool: m ? { pool: m[1], slot: m[2], repo: m[3] } : null, git, transcriptFile: tfile, subagents: subagentsFor(tfile || (tr && tr.file)), drops: await dropsCached(top || cwd),
+    };
+    if (tr && known[p.pid] === tr.rev) s.trRev = tr.rev; else s.transcript = tr;
+    return s;
+  }))).filter(Boolean);
+  // A leased slot with no Claude in it is where you were when ssh dropped or Claude exited: say what was going on there,
+  // and whether a tmux session still holds it, so it can be picked up again (or handed back).
+  const pools = readPools(), inside = (p, dir) => p === dir || p.startsWith(dir + '/');
+  await Promise.all(pools.map(async (w) => {
+    if (w.status === 'available' || !fs.existsSync(w.path)) return;
+    w.git = await gitInfoCached(w.path);
+    w.claude = sessions.some((s) => inside(s.cwd, w.path));
+    const pane = panes.find((p) => inside(p.cwd, w.path));
+    w.tmux = pane ? pane.session : '';
+    if (!w.claude) { const tr = transcriptInfoCached(w.path, null, w.git.slug); if (tr) w.last = { at: tr.lastActive, say: String(tr.lastSay || '').slice(-600), you: tr.lastUser || '' }; }
+  }));
+  const claudePanes = new Map(sessions.filter((s) => s.pane).map((s) => [s.pane, s.session]));
+  return { host: os.hostname(), platform: process.platform, home: HOME, at: Date.now(), sessions, terms: tmuxSessions(panes, claudePanes), pools, sys: sysStats() };
+}
+
+// ---- talking to a session's terminal, whichever kind it is: { term: 'tmux', pane } or { term: 'iterm', tty }
+async function screensOf(targets) {
+  const out = {}, it = targets.filter((t) => t && t.term === 'iterm').map((t) => t.tty);
+  const [im] = await Promise.all([it.length ? readScreens(it) : new Map(),
+    ...targets.filter((t) => t && t.term === 'tmux').map(async (t) => { const r = await runOk('tmux', ['capture-pane', '-p', '-t', t.pane], { timeout: 4000 }); if (r.ok) out[t.pane] = r.out; })]);
+  for (const [k, v] of im) out[k] = v;
+  return out;
+}
+async function keysTo(t, keys) {
+  if (t.term === 'iterm') return typeKeys(t.tty, keys);
+  if (t.term !== 'tmux') return '';
+  for (const k of keys) {
+    const r = await runOk('tmux', k.cr ? ['send-keys', '-t', t.pane, 'Enter'] : ['send-keys', '-t', t.pane, '-l', '--', String(k.text || '')], { timeout: 4000 });
+    if (!r.ok) return '';
+    await sleep((k.wait || 0.35) * 1000);
+  }
+  return 'ok';
+}
+// A bracketed paste (as iTerm's write text is), so newlines stay inside the message; then Enter on its own sends it.
+async function writeTo(t, text) {
+  if (t.term === 'iterm') return writeToTty(t.tty, text);
+  if (t.term !== 'tmux') return '';
+  const buf = `pebtree-${process.pid}`;
+  if (!(await runOk('tmux', ['load-buffer', '-b', buf, '-'], { timeout: 4000, input: text })).ok) return '';
+  if (!(await runOk('tmux', ['paste-buffer', '-p', '-r', '-d', '-b', buf, '-t', t.pane], { timeout: 4000 })).ok) return '';
+  await sleep(150);
+  return (await runOk('tmux', ['send-keys', '-t', t.pane, 'Enter'], { timeout: 4000 })).ok ? 'ok' : '';
+}
+
+// ---- starting sessions (what `tw`, `cx` and `hx` used to do), each in its own detached tmux session:
+//   tree    Claude in a fresh treehouse worktree of a repo; the worktree goes back to the pool when Claude exits
+//           or the session is killed (the same contract as tw: treehouse keeps it leased if it has changes)
+//   claude  Claude in a checkout or folder;  codex  Codex there;  shell  a shell, or `cmd`, in tmux session `session`
+const LAUNCH_DIR = path.join(HOME, '.local/share/pebtree/launch');
+async function spawnSession(spec) {
+  const kind = String(spec.kind || ''), at = tilde(String(spec.repo || spec.cwd || '~'));
+  if (!['tree', 'resume', 'claude', 'codex', 'shell'].includes(kind)) return { ok: false, error: `unknown kind ${kind}` };
+  if (!fs.existsSync(at)) return { ok: false, error: `${at} does not exist on ${os.hostname()}` };
+  const rand = crypto.randomBytes(2).toString('hex'), slug = (p) => path.basename(p).replace(/[^\w.-]+/g, '-').slice(0, 30) || 'home';
+  fs.mkdirSync(LAUNCH_DIR, { recursive: true });
+  let prompt = '';
+  if (String(spec.prompt || '').trim()) { const pf = path.join(LAUNCH_DIR, `${Date.now()}-${rand}.md`); fs.writeFileSync(pf, String(spec.prompt)); prompt = ` "$(cat ${shq(pf)})"`; }
+  const claude = ['claude', ...CLAUDE_ARGS, ...(spec.title ? ['-n', String(spec.title).slice(0, 50)] : [])].map(shq).join(' ') + prompt;
+  const shell = 'exec "${SHELL:-/bin/sh}" -l';
+  const has = async (n) => (await runOk('tmux', ['has-session', '-t', `=${n}`], { timeout: 4000 })).ok;
+  let cwd = at, name, lines, treePath = '', tree = '';
+  const pm = at.match(POOL_RE);
+  if (kind === 'resume' && pm) {
+    // back into a worktree you already hold: its own tmux session if one is left, else Claude picks up its last conversation
+    const left = (await readTmuxPanes()).find((p) => p.cwd === at || p.cwd.startsWith(at + '/'));
+    if (left) return { ok: true, session: left.session, path: at, tree: pm[2], existed: true };
+    treePath = at; tree = pm[2]; name = `tw-${pm[3]}-${tree}`;
+    // --continue with no earlier conversation exits at once (and the worktree would go straight back): start fresh then
+    let had = false; try { had = fs.readdirSync(path.join(HOME, '.claude/projects', at.replace(/[/.]/g, '-'))).some((f) => f.endsWith('.jsonl')); } catch { /* none */ }
+    lines = [`tw_path=${shq(treePath)}`, `trap 'treehouse return "$tw_path" </dev/null >/dev/null 2>&1; exit 129' HUP`, claude.replace(prompt, '') + (had ? " '--continue'" : ''),
+      `echo; echo 'Claude exited. Returning this worktree to the pool...'`, `treehouse return "$tw_path" || { echo "Kept it. Return it later with: treehouse return $tw_path"; ${shell}; }`];
+    treePath = ''; // it was leased before this; a failed start must not hand it back
+  } else if (kind === 'resume') { name = `cl-${slug(at)}-${rand}`; lines = [claude + " '--continue'", shell]; }
+  else if (kind === 'tree') {
+    const top = await gitTop(at);
+    if (!top) return { ok: false, error: `${at} is not a git checkout` };
+    const r = await runOk('treehouse', ['get', '--lease', '--lease-holder', `tmux:${os.userInfo().username}`], { cwd: top, timeout: 600000 });
+    treePath = r.out.trim().split('\n').pop() || '';
+    if (!treePath || !fs.existsSync(treePath)) return { ok: false, error: `treehouse gave no worktree: ${(r.err || r.out).trim().split('\n').pop() || 'no output'}` };
+    cwd = treePath; tree = path.basename(path.dirname(treePath));
+    name = `tw-${slug(top)}-${tree}`;
+    lines = [`tw_path=${shq(treePath)}`, `trap 'treehouse return "$tw_path" </dev/null >/dev/null 2>&1; exit 129' HUP`, claude,
+      `echo; echo 'Claude exited. Returning this worktree to the pool...'`, `treehouse return "$tw_path" || { echo "Kept it. Return it later with: treehouse return $tw_path"; ${shell}; }`];
+  } else if (kind === 'claude') { name = `cl-${slug(at)}-${rand}`; lines = [claude, shell]; }
+  else if (kind === 'codex') { name = `cx-${slug(at)}-${rand}`; lines = ['codex' + prompt, shell]; }
+  else {
+    name = spec.session && SAFE_NAME.test(spec.session) ? spec.session : `sh-${slug(at)}-${rand}`;
+    if (await has(name)) return { ok: true, session: name, path: at, existed: true }; // like tmux new-session -A
+    lines = [spec.cmd ? 'exec ' + String(spec.cmd).replace(/^~(?=\/)/, '"$HOME"') : shell];
+  }
+  if (await has(name)) name += `-${rand}`;
+  const script = path.join(LAUNCH_DIR, `${name}.sh`);
+  fs.writeFileSync(script, ['#!/bin/sh', `# started by pebtree ${new Date().toISOString()}`, `export PATH=${shq(process.env.PATH)}`, `cd ${shq(cwd)} || exit 1`, ...lines, ''].join('\n'), { mode: 0o755 });
+  const r = await runOk('tmux', ['new-session', '-d', '-s', name, '-n', name.slice(0, 40), '-x', '200', '-y', '50', '-c', cwd, `/bin/sh ${shq(script)}`], { timeout: 8000 });
+  if (!r.ok) { if (treePath) await runOk('treehouse', ['return', treePath], { cwd: treePath, timeout: 60000 }); return { ok: false, error: `tmux: ${r.err}` }; }
+  return { ok: true, session: name, path: cwd, tree };
+}
+
+// Ends a tmux session the way `tw --close` does: its Claude can take a minute to act on the hangup, so it is
+// stopped too. Windows linked into other sessions survive kill-session, and so does their Claude.
+async function killTerm({ session }) {
+  if (!SAFE_NAME.test(session || '')) return { ok: false, error: 'bad session name' };
+  const panes = await readTmuxPanes(), mine = panes.filter((p) => p.session === session);
+  if (!mine.length) return { ok: false, error: `no tmux session ${session}` };
+  const ttys = new Set(mine.filter((p) => !panes.some((q) => q.pane === p.pane && q.session !== session)).map((p) => p.tty));
+  const claudes = [...(await readProcesses()).values()].filter((p) => ttys.has(p.tty) && kindOf(p.args, p.comm) === 'claude').map((p) => p.pid);
+  const r = await runOk('tmux', ['kill-session', '-t', `=${session}`], { timeout: 8000 });
+  for (const pid of claudes) try { process.kill(pid, 'SIGTERM'); } catch { /* gone */ }
+  setTimeout(() => { for (const pid of claudes) try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ } }, 5000).unref();
+  return r.ok ? { ok: true, stopped: claudes.length } : { ok: false, error: r.err };
+}
+
+// What closing a session's tree would lose, and closing it: end its terminal, then hand a pool worktree back.
+async function closeInfo({ path: p }) {
+  if (!p || !fs.existsSync(p)) return { ok: false, error: `${p} is gone` };
+  const g = await gitInfoCached(p), porcelain = await run('git', ['-C', p, 'status', '--porcelain']);
+  return { ok: true, path: p, branch: g.branch, ahead: g.ahead, base: g.base, pool: POOL_RE.test(p), changes: porcelain.split('\n').filter(Boolean).map((l) => l.slice(3)).filter((f) => !/(^|\/)node_modules\//.test(f)) };
+}
+async function closeSession({ path: p, term, pane, session, tty, discard }) {
+  const info = await closeInfo({ path: p });
+  if (!info.ok) return info;
+  if (info.changes.length && !discard) return { ok: false, error: `${info.changes.length} uncommitted change(s) would be discarded` };
+  let closedTab = false;
+  if (term === 'tmux' && session) {
+    // a window of a bigger session (the codex one) closes alone; a session of its own ends whole
+    const panes = (await readTmuxPanes()).filter((x) => x.session === session);
+    if (panes.length && panes[0].windows > 1 && !/^(tw|cl|cx)-/.test(session)) { await runOk('tmux', ['kill-pane', '-t', pane]); closedTab = true; }
+    else closedTab = (await killTerm({ session })).ok;
+  } else if (term === 'iterm' && tty) {
+    const out = await run('osascript', ['-e', 'on run argv', '-e', 'tell application "iTerm2"', '-e', 'repeat with w in windows', '-e', 'repeat with t in tabs of w', '-e', 'repeat with s in sessions of t',
+      '-e', 'if tty of s is ("/dev/" & item 1 of argv) then', '-e', 'close s', '-e', 'return "closed"', '-e', 'end if', '-e', 'end repeat', '-e', 'end repeat', '-e', 'end repeat', '-e', 'end tell', '-e', 'end run', tty]);
+    closedTab = out.trim() === 'closed' || out.trim() === '';
+  }
+  let returned = '';
+  if (info.pool) {
+    await sleep(1500); // the window's own hangup trap returns it first when it can
+    const r = await runOk('treehouse', ['return', p, '--force'], { cwd: p, timeout: 60000 });
+    returned = (r.out || r.err).trim().split('\n').slice(-1)[0] || '';
+  }
+  return { ok: true, closedTab, branch: info.branch, ahead: info.ahead, returned };
+}
+
+// Files the dashboard copies into a remote tree (a drop, a pasted image) and images it shows from one.
+const IMG_TYPES = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp' };
+function putFile({ path: p, b64 }) {
+  const f = path.resolve(tilde(String(p || '')));
+  if (!f.includes(`${path.sep}.pebtree-drops${path.sep}`)) return { ok: false, error: 'only into a tree\'s .pebtree-drops' };
+  const root = f.slice(0, f.indexOf(`${path.sep}.pebtree-drops${path.sep}`) + 15);
+  fs.mkdirSync(path.dirname(f), { recursive: true });
+  if (!fs.existsSync(path.join(root, '.gitignore'))) fs.writeFileSync(path.join(root, '.gitignore'), '*\n');
+  fs.writeFileSync(f, Buffer.from(String(b64 || ''), 'base64'));
+  dropCache.clear();
+  return { ok: true, path: f };
+}
+function getFile({ path: p }) {
+  let f; try { f = fs.realpathSync(tilde(String(p || ''))); } catch { return { ok: false, error: 'not found' }; }
+  const roots = [HOME, '/tmp', '/private/tmp'].map((r) => { try { return fs.realpathSync(r); } catch { return r; } });
+  if (!IMG_TYPES[path.extname(f).toLowerCase()] || !roots.some((r) => f.startsWith(r + path.sep))) return { ok: false, error: 'not an image in an allowed folder' };
+  const st = fs.statSync(f);
+  if (!st.isFile() || st.size > 25 * 1024 * 1024) return { ok: false, error: 'not found' };
+  return { ok: true, type: IMG_TYPES[path.extname(f).toLowerCase()], b64: fs.readFileSync(f).toString('base64') };
+}
+function deleteDropsAt({ path: p, id }) {
+  const root = path.join(String(p || ''), '.pebtree-drops');
+  if (id !== 'all' && !/^[\w-]{3,60}$/.test(id)) return { ok: false, error: 'bad drop' };
+  const targets = id === 'all' ? (fs.existsSync(root) ? fs.readdirSync(root).filter((n) => n !== '.gitignore').map((n) => path.join(root, n)) : []) : [path.join(root, id)];
+  for (const d of targets) if (d.startsWith(root + path.sep)) fs.rmSync(d, { recursive: true, force: true });
+  dropCache.clear();
+  return { ok: true };
+}
+// Git checkouts a new session can start in: the folders right under each root (worktrees, whose .git is a file,
+// are left out), most recently used first; `pool` when treehouse already has a pool of worktrees for it.
+function listRepos(roots) {
+  const out = new Map(), pooled = new Set(readPools().map((w) => w.repo));
+  const dflt = process.platform === 'darwin' ? ['~', '~/Developer', '~/src', '~/code', '~/projects'] : ['~/workspace', '~'];
+  for (const r of (Array.isArray(roots) && roots.length ? roots : dflt).map(tilde)) {
+    let ents = []; try { ents = fs.readdirSync(r, { withFileTypes: true }); } catch { continue; }
+    for (const e of ents) {
+      if (!e.isDirectory() || e.name.startsWith('.')) continue;
+      const p = path.join(r, e.name), g = path.join(p, '.git');
+      let st; try { st = fs.statSync(g); } catch { continue; }
+      if (!st.isDirectory()) continue;
+      let at = st.mtimeMs; try { at = Math.max(at, fs.statSync(path.join(g, 'index')).mtimeMs); } catch { /* no index yet */ }
+      out.set(p, { path: p, name: e.name, at: Math.round(at), pool: pooled.has(e.name) });
+    }
+  }
+  return [...out.values()].sort((a, b) => b.at - a.at);
+}
+
+const AGENT_OPS = {
+  hello: async () => ({ host: os.hostname(), platform: process.platform, home: HOME, node: process.versions.node }),
+  scan: (a) => scanHost({ known: a.known }),
+  screens: (a) => screensOf(a.targets || []),
+  keys: (a) => keysTo(a.target || {}, a.keys || []),
+  write: (a) => writeTo(a.target || {}, String(a.text || '')),
+  transcript: (a) => transcriptInfo(String(a.dir || ''), a.file || null, a.slug || ''),
+  chat: (a) => chatHistory(String(a.dir || ''), Math.min(300, +a.limit || 60), a.file || null, { side: !!a.side }),
+  skills: (a) => listSkills(a.path || ''),
+  repos: (a) => listRepos(a.roots),
+  spawn: (a) => spawnSession(a),
+  kill: (a) => killTerm(a),
+  closeInfo: (a) => closeInfo(a),
+  close: (a) => closeSession(a),
+  putFile: (a) => putFile(a),
+  getFile: (a) => getFile(a),
+  deleteDrops: (a) => deleteDropsAt(a),
+};
+// `pebtree agent`: one JSON request per line on stdin ({ id, op, args }), one answer per line on stdout.
+function agentMain() {
+  const rl = require('readline').createInterface({ input: process.stdin, crlfDelay: Infinity });
+  const out = (o) => process.stdout.write(JSON.stringify(o) + '\n');
+  let busy = 0, closed = false;
+  const done = () => { if (closed && !busy) process.stdout.write('', () => process.exit(0)); };
+  rl.on('line', async (line) => {
+    let m; try { m = JSON.parse(line); } catch { return; }
+    const fn = AGENT_OPS[m.op];
+    busy++;
+    try { if (!fn) throw new Error(`unknown op ${m.op}`); out({ id: m.id, ok: true, result: await fn(m.args || {}) }); }
+    catch (e) { out({ id: m.id, ok: false, error: String((e && e.message) || e) }); }
+    busy--; done();
+  });
+  // the dashboard went away (ssh dropped): finish what is running, then exit
+  rl.on('close', () => { closed = true; done(); });
+}
+
+// ---- the hosts the dashboard follows: this Mac, plus config.json "hosts": { "<id>": { "ssh": "<ssh host>", "label", "repoRoots" } }.
+// The agent is this same file, copied to ~/.local/share/pebtree on the host whenever it changes.
+const SELF_SHA = crypto.createHash('sha1').update(fs.readFileSync(__filename)).digest('hex').slice(0, 12);
+const HOSTS = new Map();
+const sshOpts = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3', '-o', 'RemoteCommand=none'];
+function makeHost(id, conf) {
+  const h = { id, label: conf.label || (conf.ssh ? id : 'Mac'), local: !conf.ssh, ssh: conf.ssh || '', roots: conf.repoRoots || null, up: !conf.ssh, error: '', scan: null, repos: [], reposAt: 0, revs: {}, home: conf.ssh ? '' : HOME, seq: 0, pending: new Map(), child: null, retry: 0 };
+  h.call = (op, args, ms) => (h.local ? Promise.resolve().then(() => AGENT_OPS[op](args || {})) : remoteCall(h, op, args, ms));
+  return h;
+}
+for (const [id, conf] of Object.entries({ [LOCAL_HOST]: {}, ...(CONFIG.hosts || {}) })) if (/^[\w.-]+$/.test(id)) HOSTS.set(id, makeHost(id, conf || {}));
+const localHost = () => HOSTS.get(LOCAL_HOST);
+function remoteCall(h, op, args, ms = 20000) {
+  return new Promise((resolve, reject) => {
+    if (!h.child || !h.up) return reject(new Error(`${h.label} is not connected${h.error ? ` (${h.error})` : ''}`));
+    const id = ++h.seq, timer = setTimeout(() => { h.pending.delete(id); reject(new Error(`${h.label} took too long to answer (${op})`)); }, ms);
+    h.pending.set(id, { resolve, reject, timer });
+    h.child.stdin.write(JSON.stringify({ id, op, args: args || {} }) + '\n');
+  });
+}
+async function connectHost(h) {
+  h.error = 'connecting';
+  const have = await runOk('ssh', [...sshOpts, h.ssh, 'cat ~/.local/share/pebtree/sha 2>/dev/null; echo'], { timeout: 25000 });
+  if (!have.ok) { h.error = (have.err.trim().split('\n').pop() || 'ssh failed').slice(0, 200); return false; }
+  if (have.out.trim() !== SELF_SHA) {
+    const put = await runOk('ssh', [...sshOpts, h.ssh, `mkdir -p ~/.local/share/pebtree && cat > ~/.local/share/pebtree/pebtree.tmp && chmod +x ~/.local/share/pebtree/pebtree.tmp && mv ~/.local/share/pebtree/pebtree.tmp ~/.local/share/pebtree/pebtree && printf %s ${SELF_SHA} > ~/.local/share/pebtree/sha`], { timeout: 60000, input: fs.readFileSync(__filename) });
+    if (!put.ok) { h.error = `could not install the agent: ${put.err.slice(0, 160)}`; return false; }
+  }
+  const child = spawn('ssh', [...sshOpts, '-T', h.ssh, 'exec env PATH="$HOME/.local/bin:$HOME/bin:/usr/local/bin:$PATH" node ~/.local/share/pebtree/pebtree agent'], { stdio: ['pipe', 'pipe', 'pipe'] });
+  let buf = '', errTail = '';
+  child.stdout.on('data', (d) => {
+    buf += d;
+    for (let i; (i = buf.indexOf('\n')) >= 0;) {
+      const line = buf.slice(0, i); buf = buf.slice(i + 1);
+      let m; try { m = JSON.parse(line); } catch { continue; }
+      const p = h.pending.get(m.id); if (!p) continue;
+      h.pending.delete(m.id); clearTimeout(p.timer);
+      if (m.ok) p.resolve(m.result); else p.reject(new Error(m.error));
+    }
+  });
+  child.stderr.on('data', (d) => { errTail = (errTail + d).slice(-600); });
+  child.stdin.on('error', () => {});
+  child.on('exit', () => {
+    if (h.child !== child) return;
+    h.child = null; h.up = false; h.error = (errTail.trim().split('\n').pop() || 'disconnected').slice(0, 200);
+    for (const p of h.pending.values()) { clearTimeout(p.timer); p.reject(new Error(`${h.label} disconnected`)); }
+    h.pending.clear(); push({ type: 'state' });
+  });
+  h.child = child; h.up = true;
+  try { const hi = await remoteCall(h, 'hello', {}, 20000); Object.assign(h, { home: hi.home, error: '', retry: 0 }); }
+  catch (e) { h.error = e.message; h.up = false; try { child.kill(); } catch { /* gone */ } return false; }
+  return true;
+}
+// A host's last scan, with the transcripts it left out (unchanged since the one before) carried over.
+function mergeScan(h, sc) {
+  const prev = new Map(((h.scan && h.scan.sessions) || []).map((s) => [s.pid, s]));
+  for (const s of sc.sessions) if (!s.transcript && s.trRev) s.transcript = (prev.get(s.pid) || {}).transcript || null;
+  h.revs = Object.fromEntries(sc.sessions.filter((s) => s.transcript).map((s) => [s.pid, s.transcript.rev]));
+  h.scan = sc; h.error = '';
+}
+async function refreshRepos(h) {
+  if (Date.now() - h.reposAt < 120000) return;
+  h.reposAt = Date.now();
+  try { h.repos = await h.call('repos', { roots: h.roots }); } catch { h.reposAt = 0; }
+}
+async function hostLoop(h) {
+  for (;;) {
+    if (!h.up) {
+      if (!(await connectHost(h).catch((e) => { h.error = e.message; return false; }))) { h.retry = Math.min(5, h.retry + 1); await sleep(1000 * 2 ** h.retry); continue; }
+      push({ type: 'state' });
+    }
+    const t = Date.now();
+    try { mergeScan(h, await h.call('scan', { known: h.revs }, 20000)); } catch (e) { h.error = e.message; }
+    refreshRepos(h).catch(() => {});
+    await sleep(Math.max(500, FAST_MS - (Date.now() - t)));
+  }
+}
+function hostsState() {
+  return [...HOSTS.values()].map((h) => ({ id: h.id, label: h.label, local: h.local, up: h.up, error: h.error, home: h.home, terms: (h.scan && h.scan.terms) || [], repos: h.repos, sys: h.scan && h.scan.sys, at: h.scan ? h.scan.at : 0 }));
+}
+// One-click starts on the Terminals page and in `pebtree new <id>`: config.json "presets", else one per host.
+function presets() {
+  if (Array.isArray(CONFIG.presets)) return CONFIG.presets.filter((p) => p && p.id && HOSTS.has(p.host || LOCAL_HOST)).map((p) => ({ ...p, host: p.host || LOCAL_HOST }));
+  return [...HOSTS.values()].map((h) => ({ id: `${h.id}-shell`, label: `Shell on ${h.label}`, host: h.id, kind: 'shell', repo: '~' }));
+}
+
 // ---------- slow state: trees, git, transcripts, board ----------
 
 let slow = { trees: new Map(), board: null, updated: 0 };
-
-async function readTreehouse() {
-  const out = await run('treehouse', ['status'], { cwd: MAIN });
-  const trees = new Map();
-  for (const line of out.split('\n')) {
-    const m = line.match(/^(\d+)\s+(\S+)\s+(\S+)/);
-    if (m) trees.set(m[1], { tree: m[1], status: m[2], path: m[3].replace(/^~/, HOME) });
-  }
-  if (!trees.size && fs.existsSync(POOL)) {
-    for (const n of fs.readdirSync(POOL)) if (/^\d+$/.test(n)) trees.set(n, { tree: n, status: 'unknown', path: path.join(POOL, n, REPO_DIR) });
-  }
-  trees.set('main', { tree: 'main', status: 'main', path: MAIN });
-  return trees;
-}
-
-async function gitInfo(dir) {
-  const [branch, status, ahead, upstream] = await Promise.all([
-    run('git', ['-C', dir, 'branch', '--show-current']),
-    run('git', ['-C', dir, 'status', '--porcelain']),
-    run('git', ['-C', dir, 'rev-list', '--count', 'origin/master..HEAD']),
-    run('git', ['-C', dir, 'rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}']),
-  ]);
-  return { branch: branch.trim() || '(detached)', dirty: status.split('\n').filter(Boolean).length, ahead: +ahead.trim() || 0, upstream: upstream.trim() };
-}
 
 // messages that land in the transcript as "user" but were not typed by you
 const notYou = (t) => /^Another Claude session sent a message|^<agent-message|^\[SYSTEM NOTIFICATION|^This session is being continued from a previous conversation/.test(t.trim());
@@ -362,7 +802,7 @@ function pendingFor(tree, tr, claudeState) {
   if (list.length) PENDING.set(tree, list); else PENDING.delete(tree);
   return list;
 }
-function transcriptInfoCached(dir, only) {
+function transcriptInfoCached(dir, only, slug) {
   const proj = path.join(HOME, '.claude/projects', dir.replace(/[/.]/g, '-'));
   let key = only || '';
   try {
@@ -371,7 +811,9 @@ function transcriptInfoCached(dir, only) {
   } catch { return null; }
   const hit = transcriptCache.get(dir);
   if (hit && hit.key === key) return hit.info;
-  const info = transcriptInfo(dir, only);
+  const info = transcriptInfo(dir, only, slug);
+  // rev: a short name for this read, so a host only sends a transcript to the dashboard when it changed
+  if (info) info.rev = crypto.createHash('sha1').update(key).digest('hex').slice(0, 12);
   transcriptCache.set(dir, { key, info });
   return info;
 }
@@ -379,14 +821,10 @@ function transcriptInfoCached(dir, only) {
 // Claude Code writes a {"type":"pr-link"} record for every PR a session creates or links. Read each file
 // once, then only what was appended, so a large transcript is not re-read on every change.
 const prLinkCache = new Map();
-// owner/repo of this project's GitHub origin, lowercased: PR links to any other repo (a dependency, another service)
-// carry numbers that mean nothing here
-let REPO_SLUG = null;
-function repoSlug() {
-  if (REPO_SLUG === null) { try { const u = require('child_process').execFileSync('git', ['-C', MAIN, 'remote', 'get-url', 'origin'], { encoding: 'utf8', timeout: 5000 }); REPO_SLUG = ((u.match(/github\.com[:/]([\w.-]+\/[\w.-]+?)(\.git)?\s*$/) || [])[1] || '').toLowerCase(); } catch { REPO_SLUG = ''; } }
-  return REPO_SLUG;
-}
-function prLinks(file) {
+// slug: owner/repo of the session's own GitHub origin. PR links to any other repo (a dependency, another service)
+// carry numbers that mean nothing there.
+const sameRepo = (a, slug) => !slug || !a || String(a).toLowerCase() === String(slug).toLowerCase();
+function prLinks(file, slug) {
   let c = prLinkCache.get(file);
   try {
     const size = fs.statSync(file).size;
@@ -396,7 +834,7 @@ function prLinks(file) {
       fs.readSync(fd, buf, 0, buf.length, c.size); fs.closeSync(fd);
       const text = c.rest + buf.toString('utf8'), lines = text.split('\n');
       c.rest = lines.pop();
-      for (const l of lines) if (l.includes('"pr-link"')) { try { const j = JSON.parse(l); if (j.type === 'pr-link' && j.prNumber && (!j.prRepository || !repoSlug() || String(j.prRepository).toLowerCase() === repoSlug())) { c.nums = c.nums.filter((n) => n !== j.prNumber); c.nums.push(j.prNumber); } } catch { /* partial line */ } }
+      for (const l of lines) if (l.includes('"pr-link"')) { try { const j = JSON.parse(l); if (j.type === 'pr-link' && j.prNumber && sameRepo(j.prRepository, slug)) { c.nums = c.nums.filter((n) => n !== j.prNumber); c.nums.push(j.prNumber); } } catch { /* partial line */ } }
       c.size = size;
     }
     prLinkCache.set(file, c);
@@ -404,17 +842,7 @@ function prLinks(file) {
   return c.nums;
 }
 
-// Claude Code records each running session in ~/.claude/sessions/<pid>.json; its sessionId names the
-// transcript. Without it we would guess "newest file in the folder", which a background or headless run
-// in the same checkout (a journal entry, a spare) silently takes over.
-function sessionFileFor(pid, dir) {
-  const rec = pid && readJson(path.join(HOME, '.claude/sessions', `${pid}.json`), null);
-  if (!rec || !rec.sessionId) return null;
-  const f = path.join(HOME, '.claude/projects', dir.replace(/[/.]/g, '-'), `${rec.sessionId}.jsonl`);
-  return fs.existsSync(f) ? f : null;
-}
-function sessionKind(pid) { const rec = pid && readJson(path.join(HOME, '.claude/sessions', `${pid}.json`), null); return rec ? rec.kind : ''; }
-function transcriptInfo(dir, only) {
+function transcriptInfo(dir, only, slug) {
   const proj = path.join(HOME, '.claude/projects', dir.replace(/[/.]/g, '-'));
   let files;
   try { files = only ? [{ f: path.basename(only), t: fs.statSync(only).mtimeMs }] : fs.readdirSync(proj).filter((f) => f.endsWith('.jsonl')).map((f) => ({ f, t: fs.statSync(path.join(proj, f)).mtimeMs })); } catch { return null; }
@@ -446,7 +874,7 @@ function transcriptInfo(dir, only) {
     // only PRs Claude itself wrote about in its replies; command output (a PR listing) would add unrelated ones
     // PRs this session made or talks about: links and "PR #123" in Claude's own words, plus the output of its own
     // `pr create` commands (never other command output: a `pr list` would link every PR in the repo)
-    const said = [], creates = new Set(), PRLINK = /github\.com\/([\w.-]+\/[\w.-]+)\/pull\/(\d+)/g, mine = (r) => !repoSlug() || r.toLowerCase() === repoSlug(), PRREF = /\b(?:PR|pull request)\s*#(\d{3,6})\b/gi;
+    const said = [], creates = new Set(), PRLINK = /github\.com\/([\w.-]+\/[\w.-]+)\/pull\/(\d+)/g, mine = (r) => sameRepo(r, slug), PRREF = /\b(?:PR|pull request)\s*#(\d{3,6})\b/gi;
     for (const l of txt.split('\n')) {
       if (!l.includes('/pull/') && !/PR #|pull request #|pr create|pr ready/i.test(l)) continue;
       let j; try { j = JSON.parse(l); } catch { continue; }
@@ -459,7 +887,7 @@ function transcriptInfo(dir, only) {
         for (const m of out.matchAll(PRLINK)) if (mine(m[1])) said.push(+m[2]);
       }
     }
-    info.prNums = [...new Set([...prLinks(file), ...said])].slice(-10);
+    info.prNums = [...new Set([...prLinks(file, slug), ...said])].slice(-10);
     const lines = txt.split('\n');
     let lastTs = 0;
     for (let i = lines.length - 1; i >= 0 && (!info.lastSay || !info.lastUser || !lastTs); i--) {
@@ -617,46 +1045,60 @@ function keepUnparsed(tree, screen) {
   const tail = screen.split('\n').slice(-45).join('\n');
   if (!/Do you want to proceed\?|Esc to cancel|Enter to select/i.test(tail) || UNPARSED.get(tree) === tail) return;
   UNPARSED.set(tree, tail);
-  try { fs.mkdirSync(path.join(CONF_DIR, 'unparsed'), { recursive: true }); fs.writeFileSync(path.join(CONF_DIR, 'unparsed', tree + '.txt'), new Date().toISOString() + '\n' + tail); } catch {}
+  try { fs.mkdirSync(path.join(CONF_DIR, 'unparsed'), { recursive: true }); fs.writeFileSync(path.join(CONF_DIR, 'unparsed', tree.replace(/[^\w.-]+/g, '_') + '.txt'), new Date().toISOString() + '\n' + tail); } catch {}
 }
+// The terminal a session runs in, as its host's agent addresses it.
+function targetOf(x) { return x.term === 'tmux' ? { term: 'tmux', pane: x.pane, session: x.tmuxSession } : x.term === 'iterm' ? { term: 'iterm', tty: x.ttyName } : null; }
+const sessionBy = (tree) => state && state.sessions.find((x) => x.tree === tree);
+async function screenOf(sess) { const t = targetOf(sess); if (!t) return ''; const m = await hostOf(sess).call('screens', { targets: [t] }, 8000).catch(() => ({})); return m[t.pane || t.tty] || ''; }
+const hostOf = (x) => HOSTS.get(x.host) || localHost();
 async function refreshMenus(only) {
   if (!state) return;
   // every session, not only those whose title says waiting: with a question or permission prompt open the tab
   // title can keep Claude's working spinner, and that question would never be seen
   const ss = state.sessions.filter((x) => x.tty && (only ? x.tree === only : true));
-  const screens = await readScreens(ss.map((x) => x.tty));
-  for (const x of ss) {
-    trackPrompt(x, screens.get(x.tty) || '');
-    const pr = (PROMPTS.get(x.tree) || {}).text || '';
-    if (x.prompt !== pr) { x.prompt = pr; push({ type: 'session', tree: x.tree, fields: { prompt: pr } }); }
-    const menu = parseMenu(screens.get(x.tty) || '') || null, old = menus.get(x.tree) || null;
-    if (!menu) keepUnparsed(x.tree, screens.get(x.tty) || '');
-    if (menu) menus.set(x.tree, menu); else menus.delete(x.tree);
-    x.menu = menu;
-    if ((old && old.sig) !== (menu && menu.sig) || (old && JSON.stringify(old.tabs)) !== (menu && JSON.stringify(menu.tabs))) push({ type: 'session', tree: x.tree, fields: { menu } });
-  }
+  const byHost = new Map();
+  for (const x of ss) { if (!byHost.has(x.host)) byHost.set(x.host, []); byHost.get(x.host).push(x); }
+  await Promise.all([...byHost].map(async ([hid, list]) => {
+    const h = HOSTS.get(hid);
+    if (!h || !h.up) return;
+    let screens; try { screens = await h.call('screens', { targets: list.map(targetOf) }, 8000); } catch { return; }
+    for (const x of list) {
+      const t = targetOf(x), screen = screens[t.pane || t.tty];
+      if (screen === undefined) continue; // not read this time: keep what we had
+      trackPrompt(x, screen);
+      const pr = (PROMPTS.get(x.tree) || {}).text || '';
+      if (x.prompt !== pr) { x.prompt = pr; push({ type: 'session', tree: x.tree, fields: { prompt: pr } }); }
+      const menu = parseMenu(screen) || null, old = menus.get(x.tree) || null;
+      if (!menu) keepUnparsed(x.tree, screen);
+      if (menu) menus.set(x.tree, menu); else menus.delete(x.tree);
+      x.menu = menu;
+      if ((old && old.sig) !== (menu && menu.sig) || (old && JSON.stringify(old.tabs)) !== (menu && JSON.stringify(menu.tabs))) push({ type: 'session', tree: x.tree, fields: { menu } });
+    }
+  }));
 }
 async function pickMenu(tree, n, text, sig) {
-  const sess = state && state.sessions.find((x) => x.tree === tree);
-  if (!sess || !sess.tty) return { ok: false, error: 'no terminal tab for that session' };
-  const screen = (await readScreens([sess.tty])).get(sess.tty) || '', menu = parseMenu(screen);
+  const sess = sessionBy(tree);
+  if (!sess || !sess.tty) return { ok: false, error: 'no terminal for that session' };
+  const menu = parseMenu(await screenOf(sess));
   if (!menu) return { ok: false, error: 'nothing is being asked in that tab any more' };
   if (sig && menu.sig !== sig) return { ok: false, error: 'the question changed; look again' };
   const opt = menu.options.find((o) => o.n === +n);
   if (!opt) return { ok: false, error: 'no such option' };
   const keys = [{ text: String(opt.n), wait: opt.free ? 0.45 : 0.3 }];
   if (opt.free) { if (!String(text || '').trim()) return { ok: false, error: 'type an answer' }; keys.push({ text: String(text).replace(/[\r\n]+/g, ' ').slice(0, 2000), wait: 0.25 }, { cr: true, wait: 0.3 }); }
-  const out = await typeKeys(sess.tty, keys);
-  if (out.trim() !== 'ok') return { ok: false, error: 'tab not found in iTerm' };
+  const out = await hostOf(sess).call('keys', { target: targetOf(sess), keys }, 30000);
+  if (String(out).trim() !== 'ok') return { ok: false, error: 'its terminal is gone' };
   logAction({ op: 'answer', tree, label: (opt.free ? text : opt.label).slice(0, 80) });
   setTimeout(() => refreshMenus(tree).catch(() => {}), 350);
   return { ok: true };
 }
 
 async function answerAsk(tree, answers) {
-  const sess = state && state.sessions.find((x) => x.tree === tree);
-  if (!sess || !sess.tty) return { ok: false, error: 'no terminal tab for that session' };
-  const tr = transcriptInfo(sess.path, sess.transcriptFile), ask = tr && tr.ask;
+  const sess = sessionBy(tree);
+  if (!sess || !sess.tty) return { ok: false, error: 'no terminal for that session' };
+  const h = hostOf(sess), t = slow.trees.get(tree);
+  const tr = await h.call('transcript', { dir: sess.path, file: sess.transcriptFile, slug: t && t.slug }), ask = tr && tr.ask;
   if (!ask) return { ok: false, error: 'that question was already answered' };
   if (!Array.isArray(answers) || answers.length !== ask.questions.length) return { ok: false, error: 'answer every question' };
   const keys = [];
@@ -667,12 +1109,12 @@ async function answerAsk(tree, answers) {
     else if (typeof a.text === 'string' && a.text.trim()) { keys.push({ text: String(q.options.length + 1), wait: 0.45 }, { text: a.text.replace(/[\r\n]+/g, ' ').slice(0, 2000), wait: 0.25 }, { cr: true, wait: 0.45 }); }
     else return { ok: false, error: 'missing answer for question ' + (i + 1) };
   }
-  const out = await typeKeys(sess.tty, keys);
-  if (out.trim() !== 'ok') return { ok: false, error: 'tab not found in iTerm' };
+  const out = await h.call('keys', { target: targetOf(sess), keys }, 60000);
+  if (String(out).trim() !== 'ok') return { ok: false, error: 'its terminal is gone' };
   if (ask.questions.length > 1) {
     await sleep(500);
-    const screen = await run('osascript', ['-e', 'on run argv', '-e', 'tell application "iTerm2"', '-e', 'repeat with w in windows', '-e', 'repeat with t in tabs of w', '-e', 'repeat with s in sessions of t', '-e', 'if tty of s is ("/dev/" & item 1 of argv) then return contents of s', '-e', 'end repeat', '-e', 'end repeat', '-e', 'end repeat', '-e', 'end tell', '-e', 'end run', sess.tty]);
-    if (/Ready to submit your answers/.test(screen.split('\n').slice(-20).join('\n'))) await typeKeys(sess.tty, [{ text: '1' }]);
+    const screen = await screenOf(sess);
+    if (/Ready to submit your answers/.test(screen.split('\n').slice(-20).join('\n'))) await h.call('keys', { target: targetOf(sess), keys: [{ text: '1' }] });
     else return { ok: false, error: 'answers typed, but the submit step did not appear; check the tab' };
   }
   logAction({ op: 'answer', tree, label: answers.map((a, i) => a.text || ask.questions[i].options[a.opt].label).join(' / ').slice(0, 80) });
@@ -701,57 +1143,42 @@ end run`;
   return run('osascript', [...script.split('\n').flatMap((l) => ['-e', l]), tty, text]);
 }
 
-// ---- closing a tree: stop its dev processes, return it to the pool (ends its shells + Claude), close its iTerm tab
+// ---- closing a session: stop its dev processes (this Mac), end its terminal, and hand a pool worktree back
 async function closePreview(tree) {
-  if (tree === 'main') return { ok: false, error: 'main is not a pool tree and cannot be closed' };
-  const t = slow.trees.get(tree);
-  if (!t || !fs.existsSync(t.path)) return { ok: false, error: 'no such tree' };
-  const status = await run('treehouse', ['status'], { cwd: MAIN });
-  const ttysByTree = new Map();
-  for (const line of status.split('\n')) { const m = line.match(/^(\d+)\s+\S+\s+\S+\s*(.*)$/); if (m) ttysByTree.set(m[1], (m[2].match(/ttys\d+/g) || [])); }
-  const mine = ttysByTree.get(tree) || [];
-  const shared = mine.filter((tty) => [...ttysByTree].some(([n, list]) => n !== tree && list.includes(tty)));
-  const porcelain = await run('git', ['-C', t.path, 'status', '--porcelain']);
-  const changes = porcelain.split('\n').filter(Boolean).map((l) => l.slice(3)).filter((f) => !/(^|\/)node_modules\//.test(f));
-  const ahead = +(await run('git', ['-C', t.path, 'rev-list', '--count', 'origin/master..HEAD'])).trim() || 0;
-  const branch = (await run('git', ['-C', t.path, 'branch', '--show-current'])).trim() || '(detached)';
+  const sess = sessionBy(tree), t = slow.trees.get(tree);
+  if (!t || !t.path) return { ok: false, error: 'no such tree' };
+  const isPool = /^\d+$/.test(t.slot);
+  if (!isPool && !(sess && sess.term === 'tmux')) return { ok: false, error: `${idLabel(tree)} is a checkout, not a pool tree; end its session in its own terminal` };
+  const h = HOSTS.get(t.host) || localHost();
+  const info = await h.call('closeInfo', { path: t.path });
+  if (!info.ok) return info;
   const procs = state ? [...state.services.values()].filter((v) => v.tree === tree).map((v) => ({ id: v.id, kind: v.kind, label: labelFor(v), memMB: Math.round(v.memMB) })) : [];
-  const claude = procs.find((v) => v.kind === 'claude');
-  const sess = state && state.sessions.find((x) => x.tree === tree);
-  return { ok: true, tree, path: t.path, branch, ahead, changes, ttys: mine, shared, procs, claudeTty: sess && sess.tty, hostsDashboardSession: process.cwd().startsWith(t.path) };
+  if (sess && !h.local && !procs.length) procs.push({ id: sess.pid, kind: 'claude', label: `Claude session on ${h.label}`, memMB: Math.round(sess.memMB) });
+  return { ok: true, tree, host: h.id, hostLabel: h.label, pool: isPool, path: t.path, branch: info.branch, ahead: info.ahead, changes: info.changes, ttys: sess && sess.tty ? [sess.tmuxSession || sess.ttyName] : [], shared: [], procs, claudeTty: sess && sess.tty, hostsDashboardSession: h.local && process.cwd().startsWith(t.path) };
 }
 async function closeTree(tree, discard) {
   const pv = await closePreview(tree);
   if (!pv.ok) return pv;
-  if (pv.shared.length) return { ok: false, error: `its terminal (${pv.shared.join(', ')}) is shared with another tree's session; close it by hand` };
   if (pv.changes.length && !discard) return { ok: false, error: `${pv.changes.length} uncommitted change(s) would be discarded` };
-  const tty = pv.claudeTty || pv.ttys[0];
-  if (TEARDOWN) { const [cmd, ...args] = TEARDOWN.replace(/\{tree\}/g, tree).split(/\s+/); await run(cmd, args, { timeout: 60000, cwd: MAIN }); }
-  const ret = await run('treehouse', ['return', pv.path, '--force'], { cwd: MAIN, timeout: 60000 });
-  let closedTab = false;
-  if (tty) {
-    const out = await run('osascript', ['-e', 'on run argv', '-e', 'tell application "iTerm2"', '-e', 'repeat with w in windows', '-e', 'repeat with t in tabs of w', '-e', 'repeat with s in sessions of t',
-      '-e', 'if tty of s is ("/dev/" & item 1 of argv) then', '-e', 'close s', '-e', 'return "closed"', '-e', 'end if', '-e', 'end repeat', '-e', 'end repeat', '-e', 'end repeat', '-e', 'end tell', '-e', 'end run', tty]);
-    closedTab = out.trim() === 'closed' || out.trim() === ''; // empty: the tab already closed when its shell ended
-  }
+  const sess = sessionBy(tree), h = HOSTS.get(pv.host);
+  if (h.local && TEARDOWN && pv.pool) { const [cmd, ...args] = TEARDOWN.replace(/\{tree\}/g, tree.split(':')[2]).split(/\s+/); await run(cmd, args, { timeout: 60000, cwd: MAIN || HOME }); }
+  const r = await h.call('close', { path: pv.path, discard: !!discard, ...(sess ? targetOf(sess) || {} : {}) }, 120000);
+  if (!r.ok) return r;
   transcriptCache.delete(pv.path);
   logAction({ op: 'close-tree', tree, label: `${pv.branch}${pv.changes.length ? `, discarded ${pv.changes.length} change(s)` : ''}` });
-  refreshSlow().catch(() => {});
-  return { ok: true, closedTab, branch: pv.branch, ahead: pv.ahead, returned: ret.trim().split('\n').slice(-1)[0] || '' };
+  return r;
 }
 
-// Claude Code's own status line ("✻ Pondering… (12s · ↓ 1.2k tokens)") read off the session's iTerm screen
+// Claude Code's own status line ("✻ Pondering… (12s · ↓ 1.2k tokens)") read off the session's screen
 const liveCache = new Map();
 async function liveStatus(tree) {
-  const sess = state && state.sessions.find((x) => x.tree === tree);
+  const sess = sessionBy(tree);
   if (!sess || !sess.tty) return { ok: false };
   const hit = liveCache.get(tree);
   if (hit && Date.now() - hit.at < 900) return hit.v;
-  const out = await run('osascript', ['-e', 'on run argv', '-e', 'tell application "iTerm2"', '-e', 'repeat with w in windows', '-e', 'repeat with t in tabs of w', '-e', 'repeat with s in sessions of t',
-    '-e', 'if tty of s is ("/dev/" & item 1 of argv) then return contents of s', '-e', 'end repeat', '-e', 'end repeat', '-e', 'end repeat', '-e', 'end tell', '-e', 'end run', sess.tty], { timeout: 4000 });
+  const out = await screenOf(sess);
   const lines = out.split('\n').slice(-40).reverse();
-  transcriptInfoCached(sess.path, sess.transcriptFile);
-  const rev = ((transcriptCache.get(sess.path) || {}).key || '').length + ':' + ((transcriptCache.get(sess.path) || {}).key || '').slice(-60);
+  const tr = slow.trees.get(tree), rev = (tr && tr.transcript && tr.transcript.rev) || '';
   let v = { ok: true, rev, working: sess.claudeState === 'working', verb: '', detail: '' };
   for (const l of lines) {
     const m = l.match(/^\s*[·✢✳✶✻✽*]\s+([A-Z][\w'-]*…)\s*(?:\(([^)]*)\))?/);
@@ -833,11 +1260,12 @@ function watchTree(tree, dir) {
 }
 function sessionChanged(tree, dir) {
   const sess = state && state.sessions.find((x) => x.tree === tree);
-  const tr = transcriptInfoCached(dir, sess && sess.transcriptFile);
+  const t = slow.trees.get(tree);
+  const tr = transcriptInfoCached(dir, sess && sess.transcriptFile, t && t.slug);
   if (!tr || !sess) return;
-  const t = slow.trees.get(tree); if (t) t.transcript = tr;
+  if (t) t.transcript = tr;
   const fields = { ask: tr.ask || null, lastSay: tr.lastSay, lastUser: tr.lastUser, lastUserAt: tr.lastUserAt, lastActive: tr.lastActive, pending: pendingFor(tree, tr, sess.claudeState),
-    prs: treePrNums({ ...slow.trees.get(tree), transcript: tr }).map((n) => PRS.get(n) || { number: n, url: `${REPO_URL}/pull/${n}`, title: '', state: '' }) };
+    prs: treePrNums({ ...t, transcript: tr }).map((n) => prFor(t && t.slug, n)) };
   Object.assign(sess, fields);
   push({ type: 'session', tree, fields });
 }
@@ -859,27 +1287,19 @@ async function dropsFor(treePath) {
   }
   return out.sort((a, b) => b.at - a.at);
 }
-function deleteDrops(tree, id) {
-  const t = tree === 'main' ? { path: MAIN } : slow.trees.get(tree);
+async function deleteDrops(tree, id) {
+  const t = slow.trees.get(tree);
   if (!t || !t.path) return { ok: false, error: 'no such tree' };
-  const root = path.join(t.path, '.pebtree-drops');
-  if (id !== 'all' && !/^[\w-]{3,60}$/.test(id)) return { ok: false, error: 'bad drop' };
-  const targets = id === 'all' ? (fs.existsSync(root) ? fs.readdirSync(root).filter((n) => n !== '.gitignore').map((n) => path.join(root, n)) : []) : [path.join(root, id)];
-  for (const d of targets) if (d.startsWith(root + path.sep)) fs.rmSync(d, { recursive: true, force: true });
+  const r = await (HOSTS.get(t.host) || localHost()).call('deleteDrops', { path: t.path, id });
+  if (!r.ok) return r;
   logAction({ op: 'drops', tree, label: id === 'all' ? 'cleared all dropped files' : `deleted drop ${id}` });
   if (t.drops) t.drops = id === 'all' ? [] : t.drops.filter((d) => d.id !== id);
   return { ok: true };
 }
+// Trees, git and transcripts now come with every host's scan; what is left on the slow loop is the captain's board.
 async function refreshSlow() {
-  const trees = await readTreehouse();
-  await Promise.all([...trees.values()].map(async (t) => {
-    if (t.status === 'available') return;
-    if (!fs.existsSync(t.path)) return;
-    const live = state && state.sessions.find((x) => x.tree === t.tree);
-    Object.assign(t, await gitInfo(t.path), { transcript: transcriptInfoCached(t.path, live && live.transcriptFile), drops: await dropsFor(t.path) });
-    watchTree(t.tree, t.path);
-  }));
-  slow = { trees, board: readBoard(), updated: Date.now() };
+  slow.board = readBoard(); slow.updated = Date.now();
+  refreshRepos(localHost()).catch(() => {});
 }
 
 // ---------- iOS simulators ----------
@@ -993,10 +1413,52 @@ function logAction(entry) {
   try { fs.mkdirSync(CONF_DIR, { recursive: true }); fs.appendFileSync(LOG_FILE, JSON.stringify(e) + '\n'); } catch { /* log is best effort */ }
 }
 
+// Session and tree ids: <host>:<repo>:<N> for a treehouse slot, <host>:<repo>:main for a checkout, <host>:<folder>:dir
+// for anywhere else; a second Claude in the same place gets :<pid> after that.
+function idFor(h, s) {
+  if (s.pool) return `${h.id}:${s.pool.repo}:${s.pool.slot}`;
+  if (s.top) return `${h.id}:${path.basename(s.top)}:main`;
+  return `${h.id}:${path.basename(s.cwd) || 'root'}:dir`;
+}
+function idLabel(id) {
+  const [, repo, slot, n] = String(id).split(':');
+  if (!repo) return String(id);
+  return (slot === 'main' || slot === 'dir' ? repo : `${repo} ${slot}`) + (n ? ` (${n})` : '');
+}
+function treeKey(id) { const [host, repo, slot] = String(id).split(':'); return [host === LOCAL_HOST ? 0 : 1, host || '', (repo || '').toLowerCase(), slot === 'main' ? -2 : slot === 'dir' ? -1 : +slot || 0]; }
+function treeCmp(a, b) { const x = treeKey(a.tree), y = treeKey(b.tree); for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return x[i] < y[i] ? -1 : 1; return 0; }
+
+function sessionOf(h, id, s, t, svcs, now) {
+  const tr = s ? s.transcript : null, title = s ? s.title : '', slot = id.split(':')[2];
+  let claudeState = s ? claudeStateFromTitle(title) : 'none';
+  const lastActive = tr ? tr.lastActive : 0;
+  // no title Claude set (a plain ssh shell, a fresh pane): what Claude Code itself records it is doing
+  if (s && claudeState === 'unknown' && s.status) claudeState = s.status === 'busy' ? 'working' : 'waiting';
+  if (s && claudeState === 'unknown') claudeState = now - lastActive < 60000 ? 'working' : 'idle';
+  if (s && menus.has(id)) claudeState = 'waiting'; // an open question or prompt is waiting on you, whatever the title says
+  const task = h.local && slow.board && /^\d+$/.test(slot) ? slow.board.tasks.find((k) => (String(k.tree).match(/\d+/) || [''])[0] === slot && !/merged|stopped|failed/.test(k.state)) : null;
+  return {
+    tree: id, host: h.id, hostLabel: h.label, local: h.local, label: idLabel(id), repo: t.repo, slot, pid: s ? s.pid : 0,
+    term: s ? s.term : '', pane: s ? s.pane : '', tmuxSession: s ? s.session : '', tmuxAttached: s ? s.attached : 0, ttyName: s ? s.tty : '',
+    status: t.status, path: s ? s.cwd : t.path, transcriptFile: s ? s.transcriptFile : null, subagents: s ? s.subagents : [], tty: s && s.term ? s.pane || s.tty : null, remote: !!(s && /--remote-control\b/.test(s.args)),
+    branch: t.branch, dirty: t.dirty, ahead: t.ahead,
+    ask: tr ? tr.ask || null : null, menu: menus.get(id) || null, prompt: (PROMPTS.get(id) || {}).text || '',
+    claudeState, ...pickTitle(s && { id: `${h.id}:${s.pid}`, tabName: s.tabName, tabSince: s.tabSince, name: s.name }, title), lastActive, lastSay: tr ? tr.lastSay : '', lastUser: tr ? tr.lastUser : '', lastUserAt: tr ? tr.lastUserAt : 0,
+    memMB: svcs.length ? svcs.reduce((a, v) => a + v.memMB, 0) : s ? s.memMB : 0, cpu: svcs.length ? svcs.reduce((a, v) => a + v.cpu, 0) : s ? s.cpu : 0,
+    services: svcs.slice().sort((a, b) => b.memMB - a.memMB).map(publicService), task, sims: sims.filter((x) => x.tree === id), drops: t.drops || [], upstream: t.upstream && t.branch && t.upstream.endsWith('/' + t.branch) ? t.upstream : '', repoUrl: t.slug ? `https://github.com/${t.slug}` : '',
+    prs: treePrNums(t).map((n) => prFor(t.slug, n)),
+    pending: pendingFor(id, tr, claudeState),
+  };
+}
+
 async function refreshFast() {
   const procs = await readProcesses();
   const candidates = [...procs.values()].filter((p) => kindOf(p.args, p.comm)).map((p) => p.pid);
   const [cwds, listeners, top, swap, titles] = await Promise.all([readCwds(candidates), readListeners(), readTop(), readSwapAndPressure(), readItermTitles()]);
+  const lh = localHost();
+  mergeScan(lh, await scanHost({ procs, cwds, titles }));
+  // dev servers started in a checkout a session runs in count toward that session's tree
+  LOCAL_TOPS = [...new Set(lh.scan.sessions.map((s) => s.top).filter(Boolean))].sort((a, b) => b.length - a.length);
   const services = buildServices(procs, cwds, listeners, top.foot);
   for (const id of [...throttled]) if (!services.has(id)) throttled.delete(id);
 
@@ -1006,34 +1468,29 @@ async function refreshFast() {
     byTree.get(s.tree).push(s);
   }
   const now = Date.now();
-  const sessions = [];
-  const treeIds = new Set([...slow.trees.keys(), ...byTree.keys()]);
-  for (const id of treeIds) {
-    const t = slow.trees.get(id) || { tree: id, status: 'unknown', path: id === 'main' ? MAIN : path.join(POOL, id, REPO_DIR) };
-    const svcs = (byTree.get(id) || []).sort((a, b) => b.memMB - a.memMB);
-    if (t.status === 'available' && !svcs.length) continue;
-    if (id === 'main' && !svcs.length) continue;
-    const claudes = svcs.filter((s) => s.kind === 'claude' && !/bg-spare/.test(s.args));
-    const claude = claudes.find((s) => s.tty && sessionKind(s.id) === 'interactive') || claudes.find((s) => s.tty) || claudes[0];
-    const tfile = claude ? sessionFileFor(claude.id, t.path) : null;
-    const title = claude && claude.tty ? titles.get(claude.tty) : null;
-    let claudeState = claude ? claudeStateFromTitle(title) : 'none';
-    if (claude) t.transcript = transcriptInfoCached(t.path, tfile) || t.transcript;
-    const lastActive = t.transcript ? t.transcript.lastActive : 0;
-    if (claude && claudeState === 'unknown') claudeState = now - lastActive < 60000 ? 'working' : 'idle';
-    if (claude && menus.has(id)) claudeState = 'waiting'; // an open question or prompt is waiting on you, whatever the title says
-    const task = slow.board && slow.board.tasks.find((k) => (String(k.tree).match(/\bmain\b|\d+/i) || [''])[0].toLowerCase() === id && !/merged|stopped|failed/.test(k.state));
-    sessions.push({
-      tree: id, status: t.status, path: t.path, transcriptFile: tfile, subagents: claude ? subagentsFor(tfile || (t.transcript && t.transcript.file)) : [], tty: claude ? claude.tty : null, remote: !!(claude && /--remote-control\b/.test(claude.args)), branch: t.branch, dirty: t.dirty, ahead: t.ahead,
-      ask: t.transcript ? t.transcript.ask || null : null, menu: menus.get(id) || null, prompt: (PROMPTS.get(id) || {}).text || '',
-      claudeState, ...pickTitle(claude, title), lastActive, lastSay: t.transcript ? t.transcript.lastSay : '', lastUser: t.transcript ? t.transcript.lastUser : '', lastUserAt: t.transcript ? t.transcript.lastUserAt : 0,
-      memMB: svcs.reduce((a, s) => a + s.memMB, 0), cpu: svcs.reduce((a, s) => a + s.cpu, 0),
-      services: svcs.map(publicService), task, sims: sims.filter((x) => x.tree === id), drops: t.drops || [], upstream: t.upstream && t.branch && t.upstream.endsWith('/' + t.branch) ? t.upstream : '', repoUrl: REPO_URL,
-      prs: treePrNums(t).map((n) => PRS.get(n) || { number: n, url: `${REPO_URL}/pull/${n}`, title: '', state: '' }),
-      pending: pendingFor(id, t.transcript, claudeState),
-    });
+  const sessions = [], all = new Map();
+  const treeFrom = (h, id, p, git, extra) => ({ tree: id, host: h.id, local: h.local, path: p, repo: id.split(':')[1], slot: id.split(':')[2], branch: git ? git.branch : '', dirty: git ? git.dirty : 0, ahead: git ? git.ahead : 0, upstream: git ? git.upstream : '', slug: git ? git.slug : '', ...extra });
+  for (const h of HOSTS.values()) {
+    if (!h.scan) continue;
+    for (const w of h.scan.pools) { const id = `${h.id}:${w.repo}:${w.slot}`; all.set(id, treeFrom(h, id, w.path, w.git, { status: w.status, stale: w.status !== 'available' && !w.claude, tmuxSession: w.tmux || '', last: w.last || null })); }
+    // a session with a terminal claims its tree's id first, so a second Claude in the same checkout gets the suffix
+    const seen = new Set();
+    for (const s of h.scan.sessions.slice().sort((a, b) => (!!b.term - !!a.term) || a.pid - b.pid)) {
+      let id = idFor(h, s);
+      if (seen.has(id)) id += `:${s.pid}`;
+      seen.add(id);
+      const t = all.get(id) || treeFrom(h, id, s.pool ? s.cwd : s.top || s.cwd, s.git, { status: s.top ? 'main' : 'folder' });
+      if (s.git) Object.assign(t, { branch: s.git.branch, dirty: s.git.dirty, ahead: s.git.ahead, upstream: s.git.upstream, slug: s.git.slug });
+      Object.assign(t, { transcript: s.transcript, drops: s.drops });
+      all.set(id, t);
+      sessions.push(sessionOf(h, id, s, t, h.local ? byTree.get(id) || [] : [], now));
+    }
   }
-  sessions.sort((a, b) => treeOrder(a.tree) - treeOrder(b.tree));
+  // dev servers in a local tree whose Claude session has ended
+  for (const [id, svcs] of byTree) if (all.has(id) && !sessions.some((x) => x.tree === id)) sessions.push(sessionOf(lh, id, null, all.get(id), svcs, now));
+  sessions.sort(treeCmp);
+  slow.trees = all;
+  for (const x of sessions) if (x.local && x.transcriptFile) watchTree(x.tree, x.path);
 
   const treeMem = {};
   const treeCpu = {};
@@ -1045,10 +1502,11 @@ async function refreshFast() {
     trees: treeMem, treeCpu,
   });
 
-  const trees = [...slow.trees.values()].filter((t) => t.tree !== 'main').sort((a, b) => treeOrder(a.tree) - treeOrder(b.tree)).map((t) => {
+  // the Trees page: every pool slot on every host
+  const trees = [...all.values()].filter((t) => /^\d+$/.test(t.slot)).sort(treeCmp).map((t) => {
     const sess = sessions.find((x) => x.tree === t.tree);
     return {
-      tree: t.tree, status: t.status, branch: t.branch || '', dirty: t.dirty || 0, ahead: t.ahead || 0,
+      tree: t.tree, host: t.host, status: t.status, stale: !sess && !!t.stale, tmuxSession: t.tmuxSession || '', last: !sess ? t.last : null, branch: t.branch || '', dirty: t.dirty || 0, ahead: t.ahead || 0,
       lastActive: sess ? sess.lastActive : (t.transcript ? t.transcript.lastActive : 0),
       claudeState: sess ? sess.claudeState : 'none', title: sess ? sess.title : '',
       memMB: sess ? Math.round(sess.memMB) : 0, servers: sess ? sess.services.filter((x) => SERVER_KINDS.has(x.kind)).length : 0,
@@ -1056,18 +1514,11 @@ async function refreshFast() {
     };
   });
   const maxTrees = readMaxTrees() || 0;
-  const highest = Math.max(maxTrees, ...trees.map((t) => +t.tree));
-  for (let n = 1; n <= highest; n++) {
-    if (!trees.some((t) => +t.tree === n)) trees.push({ tree: String(n), status: 'empty', branch: '', dirty: 0, ahead: 0, lastActive: 0, claudeState: 'none', title: '', memMB: 0, servers: 0, stoppable: 0 });
-  }
-  trees.sort((a, b) => treeOrder(a.tree) - treeOrder(b.tree));
-  const inUse = trees.filter((t) => t.status !== 'available' && t.status !== 'empty').length;
+  const inUse = trees.filter((t) => t.status !== 'available').length;
   setImmediate(() => push({ type: 'state' }));
-  state = { at: now, sys, sessions, services, trees, pool: { max: maxTrees || null, inUse, total: trees.filter((t) => t.status !== 'empty').length }, board: slow.board };
+  state = { at: now, sys, sessions, services, trees, pool: { max: maxTrees || null, inUse, total: trees.length }, board: slow.board };
   await autoReap();
 }
-
-function treeOrder(tree) { return tree === 'main' ? -1 : Number(tree); }
 
 function publicService(s) {
   return { devices: [...(serverDevices.get(s.id) || [])], id: s.id, tree: s.tree, kind: s.kind, label: s.label, ports: s.ports, memMB: Math.round(s.memMB), cpu: +s.cpu.toFixed(1), age: s.age, pids: s.pids.length, orphan: s.orphan, throttled: s.throttled, mcpCount: s.mcpCount, killable: KILLABLE.has(s.kind) };
@@ -1223,61 +1674,55 @@ function subagentsFor(file) {
   return out.sort((a, b) => (a.finished - b.finished) || b.lastAt - a.lastAt).slice(0, 12);
 }
 
-// ---- PRs: one gh-axi listing of recent PRs, matched to trees by the PR links their sessions posted
-let REPO_URL = '';
+// ---- PRs: one `gh pr list` per repo the trees belong to, matched to trees by the PR links their sessions posted
+// and by the branch they push. Keyed "<owner/repo>#<number>": sessions span several repos.
 const PRS = new Map();
-function csvRow(l) { const out = []; let cur = '', q = false; for (const ch of l) { if (ch === '"') q = !q; else if (ch === ',' && !q) { out.push(cur); cur = ''; } else cur += ch; } out.push(cur); return out; }
+const prKey = (slug, n) => `${String(slug || '').toLowerCase()}#${n}`;
+function prFor(slug, n) { return PRS.get(prKey(slug, n)) || { number: n, repo: slug || '', url: slug ? `https://github.com/${slug}/pull/${n}` : '', title: '', state: '' }; }
+const prState = (p) => (p.state === 'MERGED' ? 'merged' : p.state === 'CLOSED' ? 'closed' : p.isDraft ? 'draft' : 'open');
+function keepPR(slug, p) {
+  const k = prKey(slug, p.number);
+  PRS.set(k, { ...PRS.get(k), repo: slug, number: p.number, title: p.title || '', state: prState(p), review: (p.reviewDecision || '').toLowerCase(), author: (p.author && p.author.login) || '', updatedAt: Date.parse(p.updatedAt) || 0, url: p.url, head: p.headRefName || '' });
+}
+async function ghJson(args) { const r = await runOk('gh', args, { timeout: 90000 }); if (!r.ok) return null; try { return JSON.parse(r.out); } catch { return null; } }
+let ME = '';
 async function refreshPRs() {
-  if (!REPO_URL) { const u = (await run('git', ['-C', MAIN, 'remote', 'get-url', 'origin'])).trim(); const m = u.match(/github\.com[:/]([\w.-]+\/[\w.-]+?)(\.git)?$/); if (m) REPO_URL = `https://github.com/${m[1]}`; }
-  const out = await run('npx', ['-y', 'gh-axi', 'pr', 'list', '--state', 'all', '--limit', '100', '--fields', 'updatedAt,url'], { cwd: MAIN, timeout: 90000 });
-  const now = Date.now(), unit = { s: 1e3, m: 6e4, h: 36e5, d: 864e5, w: 6048e5, mo: 2592e6, y: 31536e6 };
-  for (const l of out.split('\n')) {
-    if (!/^\s+\d+,/.test(l)) continue;
-    const [number, title, st, author, draft, review, updated, url] = csvRow(l.trim());
-    const um = String(updated || '').match(/^(\d+)\s*(mo|[smhdwy])/);
-    PRS.set(+number, { ...PRS.get(+number), number: +number, title, state: draft === 'yes' && st === 'open' ? 'draft' : st, review: review && review !== 'none' ? review : '', author, updatedAt: um ? now - (+um[1]) * unit[um[2]] : 0, url: /^https:/.test(url || '') ? url : `${REPO_URL}/pull/${number}` });
+  if (!ME && !CONFIG.githubUser) ME = (await run('gh', ['api', 'user', '-q', '.login'], { timeout: 30000 })).trim();
+  const slugs = [...new Set([...slow.trees.values()].map((t) => t.slug).filter(Boolean))];
+  for (const slug of slugs) {
+    const list = await ghJson(['pr', 'list', '-R', slug, '--state', 'all', '--limit', '80', '--json', 'number,title,state,isDraft,author,updatedAt,url,reviewDecision,headRefName']);
+    for (const p of list || []) keepPR(slug, p);
   }
-  const owner = (REPO_URL.match(/github\.com\/([^/]+)\//) || [])[1], repo = REPO_URL.replace(/^https:\/\/github\.com\//, '');
-  const stale = [...new Set([...slow.trees.values()].map((t) => String(t.upstream || '').replace(/^[^/]+\//, '')).filter((b) => b && b !== 'master' && b !== 'main'))].filter((b) => now - ((BRANCH_PRS.get(b) || {}).at || 0) > 300000).slice(0, 8);
-  for (const b of owner ? stale : []) {
-    const v = await run('npx', ['-y', 'gh-axi', 'api', `repos/${repo}/pulls?head=${owner}:${b}&state=all&per_page=10`], { cwd: MAIN, timeout: 60000 });
-    BRANCH_PRS.set(b, { nums: [...v.matchAll(/^\s*number: (\d+)/gm)].map((m) => +m[1]), at: now });
-  }
-  // Open PRs a tree linked: how mergeable they are (conflicts, behind master, failing checks), rechecked every 5 minutes
-  const open = [];
-  for (const t of slow.trees.values()) for (const n of treePrNums(t)) { const p = PRS.get(n); if (p && (p.state === 'open' || p.state === 'draft') && now - (p.mergeAt || 0) > 300000) open.push(p); }
-  const me = ghUser(); for (const p of PRS.values()) if (me && p.author === me && (p.state === 'open' || p.state === 'draft') && now - (p.mergeAt || 0) > 300000) open.push(p);
-  for (const p of [...new Set(open)].slice(0, 10)) {
-    const v = await run('npx', ['-y', 'gh-axi', 'pr', 'view', String(p.number)], { cwd: MAIN, timeout: 60000 });
-    const ms = (v.match(/^\s*merge_state: "?([a-z_]+)/m) || [])[1], fails = +((v.match(/^\s*checks: "?\d+ passed, (\d+) failed/m) || [])[1] || 0);
-    if (ms) Object.assign(p, { merge: ms, failing: fails, mergeAt: now });
+  // Open PRs a tree linked, and yours: how mergeable they are (conflicts, behind, failing checks), rechecked every 5 minutes
+  const now = Date.now(), open = new Set(), me = ghUser();
+  for (const t of slow.trees.values()) for (const n of treePrNums(t)) { const p = PRS.get(prKey(t.slug, n)); if (p && (p.state === 'open' || p.state === 'draft')) open.add(p); }
+  for (const p of PRS.values()) if (me && p.author === me && (p.state === 'open' || p.state === 'draft')) open.add(p);
+  for (const p of [...open].filter((p) => now - (p.mergeAt || 0) > 300000).slice(0, 12)) {
+    const v = await ghJson(['pr', 'view', String(p.number), '-R', p.repo, '--json', 'mergeStateStatus,statusCheckRollup']);
+    if (!v) continue;
+    const failing = (v.statusCheckRollup || []).filter((c) => /^(FAILURE|TIMED_OUT|ERROR|STARTUP_FAILURE)$/.test(c.conclusion || c.state || '')).length;
+    Object.assign(p, { merge: String(v.mergeStateStatus || '').toLowerCase(), failing, mergeAt: now });
   }
   // PRs a tree linked that are older than the listing: look each up once (a closed or merged PR stays that way)
-  const wanted = new Set();
-  for (const t of slow.trees.values()) for (const n of treePrNums(t)) if (!PRS.has(n) && !PRS_VIEWED.has(n)) wanted.add(n);
-  for (const n of [...wanted].slice(0, 12)) {
-    PRS_VIEWED.add(n);
-    const v = await run('npx', ['-y', 'gh-axi', 'pr', 'view', String(n)], { cwd: MAIN, timeout: 60000 });
-    const f = (k) => ((v.match(new RegExp(`^\\s*${k}: "?(.*?)"?$`, 'm')) || [])[1] || '');
-    const st = f('state');
-    if (!st) continue;
-    PRS.set(n, { number: n, title: f('title'), state: f('merged') === 'yes' ? 'merged' : f('draft') === 'yes' && st === 'open' ? 'draft' : st, review: '', author: f('author'), url: `${REPO_URL}/pull/${n}` });
-  }
+  const wanted = [];
+  for (const t of slow.trees.values()) for (const n of treePrNums(t)) { const k = prKey(t.slug, n); if (t.slug && !PRS.has(k) && !PRS_VIEWED.has(k)) { PRS_VIEWED.add(k); wanted.push([t.slug, n]); } }
+  for (const [slug, n] of wanted.slice(0, 12)) { const v = await ghJson(['pr', 'view', String(n), '-R', slug, '--json', 'number,title,state,isDraft,author,updatedAt,url,reviewDecision,headRefName']); if (v) keepPR(slug, v); }
 }
 const PRS_VIEWED = new Set();
-// PRs whose head is the branch a tree pushes to (its upstream), so a PR shows on the tree that pushed it even when
-// the session never printed the link. branch -> { nums, at }, rechecked every 5 minutes.
-const BRANCH_PRS = new Map();
+// PRs a session linked, plus those whose head is the branch its tree pushes to, so a PR shows on the tree that
+// pushed it even when the session never printed the link.
 function treePrNums(t) {
-  const up = String(t.upstream || '').replace(/^[^/]+\//, ''), byBranch = (up && up !== 'master' && up !== 'main' && BRANCH_PRS.get(up)) || { nums: [] };
-  return [...new Set([...((t.transcript && t.transcript.prNums) || []), ...byBranch.nums])].slice(-12);
+  if (!t) return [];
+  const up = String(t.upstream || '').replace(/^[^/]+\//, '') || t.branch, slug = String(t.slug || '').toLowerCase();
+  const byBranch = up && up !== 'master' && up !== 'main' && up !== '(detached)' ? [...PRS.values()].filter((p) => p.head === up && p.repo.toLowerCase() === slug).map((p) => p.number) : [];
+  return [...new Set([...((t.transcript && t.transcript.prNums) || []), ...byBranch])].slice(-12);
 }
-// Who "mine" is: the author of most PRs your trees linked (no extra GitHub call, no config).
-function ghUser() { const c = {}; for (const t of slow.trees.values()) for (const n of (t.transcript && t.transcript.prNums) || []) { const p = PRS.get(n); if (p && p.author) c[p.author] = (c[p.author] || 0) + 1; } return CONFIG.githubUser || Object.keys(c).sort((a, b) => c[b] - c[a])[0] || ''; }
+// Who "mine" is: config.json githubUser, else whoever gh is logged in as.
+function ghUser() { return CONFIG.githubUser || ME; }
 function allPRs() {
   const byPr = {};
-  for (const t of slow.trees.values()) for (const n of treePrNums(t)) (byPr[n] = byPr[n] || []).push(t.tree);
-  return [...PRS.values()].map((p) => ({ ...p, trees: byPr[p.number] || [] }));
+  for (const t of slow.trees.values()) for (const n of treePrNums(t)) (byPr[prKey(t.slug, n)] = byPr[prKey(t.slug, n)] || []).push(t.tree);
+  return [...PRS.values()].map((p) => ({ ...p, trees: byPr[prKey(p.repo, p.number)] || [] }));
 }
 
 // ---- captain: one swarm-master session in its own leased tree (it never edits files, so a fresh tree keeps it
@@ -1309,38 +1754,37 @@ async function startCaptain(objectives) {
 // ---- spin-off: hand an unrelated task to a fresh tree with its own Claude session
 const SPINOFF_DIR = path.join(CONF_DIR, 'spinoffs');
 function slugify(t) { return String(t).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').split('-').slice(0, 5).join('-') || 'task'; }
-async function spinoff({ task, title, from }) {
+// Where a spin-off goes: the host and repo of the session it came from, else config.json "spinoff": { host, repo },
+// else the first preset that starts a tree, else this Mac's configured checkout.
+function spinoffTarget(from) {
+  const t = from && slow.trees.get(from);
+  if (t && t.path) return { host: t.host, repo: t.path };
+  const c = CONFIG.spinoff || presets().find((p) => p.kind === 'tree');
+  return c ? { host: c.host || LOCAL_HOST, repo: c.repo } : { host: LOCAL_HOST, repo: MAIN };
+}
+async function spinoff({ task, title, from, host, repo }) {
   task = String(task || '').trim();
   if (!task) return { ok: false, error: 'the task is empty' };
   title = String(title || task.split('\n')[0]).replace(/\s+/g, ' ').trim().slice(0, 50);
-  const id = `${new Date().toISOString().slice(0, 10)}-${slugify(title)}-${Date.now().toString(36).slice(-4)}`;
-  const leased = await run('treehouse', ['get', '--lease', '--lease-holder', `spinoff:${id}`], { cwd: MAIN, timeout: 600000 });
-  const treePath = leased.trim().split('\n').pop();
-  if (!treePath || !fs.existsSync(treePath)) return { ok: false, error: 'no free tree in the pool (treehouse get --lease gave nothing)' };
-  const tree = path.basename(path.dirname(treePath));
-  const branch = `az/${slugify(title)}`;
-  const brief = `You were spun off${from ? ` from tree ${from}` : ''} to do one self-contained task, here in tree ${tree} (${treePath}).
+  const tgt = host && repo ? { host, repo } : spinoffTarget(from), h = HOSTS.get(tgt.host);
+  if (!h || !tgt.repo) return { ok: false, error: 'nowhere to spin off to: set "spinoff": { "host", "repo" } in config.json' };
+  const branch = `${CONFIG.branchPrefix || ''}${slugify(title)}`;
+  const brief = `You were spun off${from ? ` from ${idLabel(from)}` : ''} to do one self-contained task, here in a fresh worktree.
 
 Before anything else:
 1. Run \`git status\` and \`git branch --show-current\`. If this tree has uncommitted changes, or is on a branch that is not yours, stop and tell me; never discard someone's work.
-2. Otherwise: \`git fetch origin\` and \`git switch -c ${branch} origin/master\` (pick another name if that branch exists).
+2. Otherwise: \`git fetch origin\` and \`git switch -c ${branch} origin/HEAD\` (pick another name if that branch exists).
 
 Then do the task below, following the repo's CLAUDE.md. Commit on your branch; ask me before pushing or opening a PR unless the task says to. When done, summarize what changed, how you checked it, and anything left.
 
 ## Task
 ${task}
 `;
-  fs.mkdirSync(SPINOFF_DIR, { recursive: true });
-  const briefFile = path.join(SPINOFF_DIR, `${id}.md`), launch = path.join(SPINOFF_DIR, `${id}.sh`);
-  fs.writeFileSync(briefFile, brief);
-  // the tab runs a launcher; typing into a fresh shell races its startup and loses the command
-  fs.writeFileSync(launch, `#!/bin/zsh -li\ncd ${JSON.stringify(treePath)} || exit 1\nclaude -n ${JSON.stringify(title)} "$(cat ${JSON.stringify(briefFile)})"\nexec zsh -l\n`, { mode: 0o755 });
-  const out = await run('osascript', ['-e', 'on run argv', '-e', 'tell application "iTerm2"', '-e', 'if (count of windows) = 0 then',
-    '-e', 'create window with default profile command (item 1 of argv)', '-e', 'else', '-e', 'set w to current window', '-e', 'set prevTab to current tab of w',
-    '-e', 'tell w to create tab with default profile command (item 1 of argv)', '-e', 'try', '-e', 'tell prevTab to select', '-e', 'end try', '-e', 'end if', '-e', 'return "ok"', '-e', 'end tell', '-e', 'end run', `/bin/zsh -lic ${launch}`]);
+  const r = await h.call('spawn', { kind: 'tree', repo: tgt.repo, prompt: brief, title }, 600000);
+  if (!r.ok) return r;
+  const tree = `${h.id}:${path.basename(r.path)}:${r.tree}`;
   logAction({ op: 'spinoff', tree, label: title });
-  refreshSlow().catch(() => {});
-  return out.trim() === 'ok' ? { ok: true, tree, path: treePath, branch, title, brief: briefFile } : { ok: false, error: 'tree leased but the iTerm tab did not open', tree, path: treePath };
+  return { ok: true, tree, host: h.id, session: r.session, path: r.path, branch, title };
 }
 async function spinoffCli(argv) {
   const opt = { task: '', title: '', from: '' };
@@ -1351,9 +1795,9 @@ async function spinoffCli(argv) {
     else opt.task += (opt.task ? ' ' : '') + argv[i];
   }
   if (!opt.task.trim()) { console.log('usage: pebtree spinoff [--title "short name"] [--from <tree>] (--brief-file brief.md | "task text")'); process.exit(1); }
-  await refreshSlow().catch(() => {});
-  const r = await spinoff(opt);
-  console.log(r.ok ? `spun off to tree ${r.tree} (${r.path})\n  branch: ${r.branch}\n  title:  ${r.title}\n  brief:  ${r.brief}` : `pebtree spinoff: ${r.error}`);
+  // run from inside a checkout: a new tree of the same repo, on this machine
+  const r = await spinoff({ ...opt, host: LOCAL_HOST, repo: process.cwd() });
+  console.log(r.ok ? `spun off to ${idLabel(r.tree)} (${r.path}), tmux session ${r.session}\n  branch: ${r.branch}\n  title:  ${r.title}` : `pebtree spinoff: ${r.error}`);
   process.exit(r.ok ? 0 : 1);
 }
 
@@ -1370,8 +1814,9 @@ async function proofCli(argv) {
     process.exit(opts.help ? 0 : 1);
   }
   const cwd = process.cwd();
-  const tree = treeOf(cwd) || 'other';
   const top = (await run('git', ['rev-parse', '--show-toplevel'], { cwd })).trim() || cwd;
+  LOCAL_TOPS = [top];
+  const tree = treeOf(cwd) || 'other';
   const branch = (await run('git', ['branch', '--show-current'], { cwd })).trim();
   const at = Date.now();
   const id = new Date(at).toISOString().replace(/[:.]/g, '-') + '-' + (opts.title || 'proof').toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 40).replace(/-+$/, '');
@@ -1453,7 +1898,7 @@ async function tkWriteBackPRs() {
   for (const [id, st] of Object.entries(tkStarted)) {
     const t = TICKETS.get(id), tr = slow.trees.get(String(st.tree));
     if (!t || t.pr_url || !tr) continue;
-    const pr = treePrNums(tr).map((n) => PRS.get(n)).filter(Boolean).find((p) => p.url && p.state !== 'closed');
+    const pr = treePrNums(tr).map((n) => PRS.get(prKey(tr.slug, n))).filter(Boolean).find((p) => p.url && p.state !== 'closed');
     if (pr) { try { await tkPatch(id, { pr_url: pr.url }); logAction({ op: 'ticket', tree: String(st.tree), label: `PR #${pr.number} written to "${t.title.slice(0, 40)}"` }); } catch (e) { tkError = String(e.message).slice(0, 200); } }
   }
 }
@@ -1515,7 +1960,7 @@ This runs unattended for my dev journal, so adjust the skill:
   const started = Date.now();
   const out = await new Promise((resolve) => {
     journalChild = execFile('claude', ['-p', prompt, '--output-format', 'text', '--allowedTools', 'Bash(git log:*),Bash(git config:*),Bash(git show:*),Bash(npx -y gh-axi:*),Read,Grep,Glob,Skill'],
-      { cwd: MAIN, maxBuffer: 16 * 1024 * 1024, timeout: 20 * 60000 }, (err, stdout, stderr) => resolve({ err, text: String(stdout || '').trim(), stderr: String(stderr || '').trim() }));
+      { cwd: MAIN || HOME, maxBuffer: 16 * 1024 * 1024, timeout: 20 * 60000 }, (err, stdout, stderr) => resolve({ err, text: String(stdout || '').trim(), stderr: String(stderr || '').trim() }));
     // no input is coming: an open stdin makes claude wait 3s and print a warning that used to read as a failure
     if (journalChild.stdin) journalChild.stdin.end();
   });
@@ -1545,6 +1990,9 @@ async function fillJournal(trigger) {
 // Fires once a day at 7:00 local, or on the first check after 7:00 if the Mac was asleep: writes every missing day.
 async function journalTick() {
   if (!settings.journalEnabled) return;
+  // without its skill a run would only spend a Claude call on nothing; the Journal tab's buttons still work
+  const js = JOURNAL_SKILL.replace(/^\//, '');
+  if (!fs.existsSync(path.join(HOME, '.claude/skills', js, 'SKILL.md')) && !(MAIN && fs.existsSync(path.join(MAIN, '.claude/skills', js, 'SKILL.md')))) return;
   const now = new Date();
   if (now.getHours() < JOURNAL_HOUR) return;
   const today = localDate(now);
@@ -1569,8 +2017,16 @@ const BUILD = String(Math.round(fs.statSync(__filename).mtimeMs));
 function serialState(wantCoarse) {
   if (!state) return { loading: true };
   const { services, ...rest } = state;
-  const all = [...services.values()].filter((s) => s.kind !== 'claude').map(publicService).sort((a, b) => treeOrder(a.tree) - treeOrder(b.tree) || b.memMB - a.memMB);
-  return { ...rest, sims, servers: all, history: historyFor('1h'), ...(wantCoarse ? { coarse: historyFor('24h') } : {}), settings: { ...settings, lock: undefined }, lock: { enabled: lockOn(), minutes: lockMinutes(), set: !!(settings.lock && settings.lock.hash) }, actions: actionLog.slice().reverse(), slowUpdated: slow.updated, build: BUILD, prsAll: allPRs(), ghUser: ghUser(), decisions: readDecisions().filter((x) => x.status === 'open'), tickets: ticketsState() };
+  const all = [...services.values()].filter((s) => s.kind !== 'claude').map(publicService).sort((a, b) => treeCmp(a, b) || b.memMB - a.memMB);
+  return { ...rest, hosts: hostsState(), presets: presets(), ids: idsMeta(), sims, servers: all, history: historyFor('1h'), ...(wantCoarse ? { coarse: historyFor('24h') } : {}), settings: { ...settings, lock: undefined }, lock: { enabled: lockOn(), minutes: lockMinutes(), set: !!(settings.lock && settings.lock.hash) }, actions: actionLog.slice().reverse(), slowUpdated: slow.updated, build: BUILD, prsAll: allPRs(), ghUser: ghUser(), decisions: readDecisions().filter((x) => x.status === 'open'), tickets: ticketsState() };
+}
+
+// How the page names every tree and session id it may show: "cbc-ditto 24" and which host it is on.
+function idsMeta() {
+  const out = {}, add = (id, host) => { if (out[id]) return; const h = HOSTS.get(host) || {}; out[id] = { label: idLabel(id), host, hostLabel: h.label || host, local: !!h.local, slot: String(id).split(':')[2] || '' }; };
+  for (const t of slow.trees.values()) add(t.tree, t.host);
+  if (state) for (const x of state.sessions) add(x.tree, x.host);
+  return out;
 }
 
 // ---- lock: a passcode that pebtree's server enforces. While locked, every route except the page itself, the lock
@@ -1614,33 +2070,36 @@ const server = http.createServer(async (req, res) => {
     req.on('close', () => { clearInterval(ping); streams.delete(res); });
     return;
   }
-  if (req.method === 'GET' && url.pathname === '/api/skills') { const t = slow.trees.get(url.searchParams.get('tree') || ''); return send(res, 200, { items: listSkills(t ? t.path : MAIN) }); }
+  if (req.method === 'GET' && url.pathname.startsWith('/vendor/')) return serveVendor(res, url.pathname.slice(8));
+  if (req.method === 'GET' && url.pathname === '/api/skills') { const t = slow.trees.get(url.searchParams.get('tree') || ''); return send(res, 200, { items: await (t ? HOSTS.get(t.host) || localHost() : localHost()).call('skills', { path: t ? t.path : MAIN }).catch(() => []) }); }
   if (req.method === 'GET' && url.pathname === '/api/live') return send(res, 200, await liveStatus(url.searchParams.get('tree') || ''));
   if (req.method === 'GET' && url.pathname === '/api/subchat') {
     const cs = state && state.sessions.find((x) => x.tree === url.searchParams.get('tree')), id = url.searchParams.get('id') || '';
     const base = cs && (cs.transcriptFile || (slow.trees.get(cs.tree) || {}).transcript && slow.trees.get(cs.tree).transcript.file);
     if (!base || !/^[\w-]+$/.test(id)) return send(res, 200, { items: [] });
     const f = base.replace(/\.jsonl$/, '') + '/subagents/' + id + '.jsonl';
-    return send(res, 200, { items: fs.existsSync(f) ? chatHistory(cs.path, 300, f, { side: true }) : [] });
+    return send(res, 200, { items: await hostOf(cs).call('chat', { dir: cs.path, limit: 300, file: f, side: true }).catch(() => []) });
   }
   if (req.method === 'GET' && url.pathname === '/api/chat') {
-    const t = slow.trees.get(url.searchParams.get('tree') || '');
     const cs = state && state.sessions.find((x) => x.tree === url.searchParams.get('tree'));
-    return send(res, 200, { items: t && fs.existsSync(t.path) ? chatHistory(t.path, Math.min(200, +url.searchParams.get('limit') || 60), cs && cs.transcriptFile) : [] });
+    if (!cs || !cs.path) return send(res, 200, { items: [] });
+    return send(res, 200, { items: await hostOf(cs).call('chat', { dir: cs.path, limit: Math.min(200, +url.searchParams.get('limit') || 60), file: cs.transcriptFile }).catch(() => []) });
   }
   if (req.method === 'GET' && url.pathname === '/api/journal') return send(res, 200, { entries: listJournal(), running: journalRunning, missing: missingDays(), enabled: !!settings.journalEnabled, hour: JOURNAL_HOUR });
   if (req.method === 'GET' && url.pathname === '/api/state') return send(res, 200, serialState(url.searchParams.get('coarse') === '1'));
   // One file of a drop, uploaded by the page: written to <tree>/.pebtree-drops/<batch>/<its path inside the drop>.
   if (req.method === 'POST' && url.pathname === '/api/drop-file') {
     if (req.headers['x-pebtree-token'] !== TOKEN) return send(res, 403, { error: 'token' });
-    const tid = url.searchParams.get('tree') || '', tt = tid === 'main' ? { path: MAIN } : slow.trees.get(tid);
-    if (!tt || !tt.path || !fs.existsSync(tt.path)) return send(res, 400, { error: 'no such tree' });
+    const tid = url.searchParams.get('tree') || '', tt = slow.trees.get(tid);
+    if (!tt || !tt.path || (tt.local && !fs.existsSync(tt.path))) return send(res, 400, { error: 'no such tree' });
     const batch = url.searchParams.get('batch') || '', rel = String(url.searchParams.get('rel') || '').replace(/^\/+/, '');
     if (!/^[\w-]{6,40}$/.test(batch) || !rel || rel.split('/').some((seg) => !seg || seg === '.' || seg === '..')) return send(res, 400, { error: 'bad path' });
     const root = path.join(tt.path, '.pebtree-drops'), dest = path.join(root, batch, rel);
     if (!dest.startsWith(path.join(root, batch) + path.sep)) return send(res, 400, { error: 'bad path' });
     let size = 0; const chunks = [];
-    for await (const c of req) { size += c.length; if (size > 200 * 1024 * 1024) return send(res, 413, { error: 'a single file over 200 MB' }); chunks.push(c); }
+    const max = tt.local ? 200 : 25; // a file for another host travels in the agent's JSON, so smaller
+    for await (const c of req) { size += c.length; if (size > max * 1024 * 1024) return send(res, 413, { error: `a single file over ${max} MB` }); chunks.push(c); }
+    if (!tt.local) { const r = await HOSTS.get(tt.host).call('putFile', { path: dest, b64: Buffer.concat(chunks).toString('base64') }, 120000).catch((e) => ({ ok: false, error: e.message })); return send(res, r.ok ? 200 : 500, r.ok ? { ok: true, path: dest, dir: path.join(root, batch) } : { error: r.error }); }
     fs.mkdirSync(path.dirname(dest), { recursive: true });
     if (!fs.existsSync(path.join(root, '.gitignore'))) fs.writeFileSync(path.join(root, '.gitignore'), '*\n');
     fs.writeFileSync(dest, Buffer.concat(chunks));
@@ -1654,7 +2113,13 @@ const server = http.createServer(async (req, res) => {
     const chunks = []; let size = 0;
     for await (const c of req) { size += c.length; if (size > 20 * 1024 * 1024) return send(res, 413, { error: 'images up to 20 MB' }); chunks.push(c); }
     // saved inside the session's own tree (git-ignored), like dropped files; pebtree's folder only when there is no tree
-    const tid = String(req.headers['x-pebtree-tree'] || ''), tt = tid === 'main' ? { path: MAIN } : slow.trees.get(tid);
+    const tid = String(req.headers['x-pebtree-tree'] || ''), tt = slow.trees.get(tid);
+    if (tt && !tt.local) {
+      // an image for a session on another host goes into its tree there, where that Claude can open it
+      const f = path.join(tt.path, '.pebtree-drops', 'images', `${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}-${crypto.randomBytes(3).toString('hex')}.${ext}`);
+      const r = await HOSTS.get(tt.host).call('putFile', { path: f, b64: Buffer.concat(chunks).toString('base64') }, 60000).catch((e) => ({ ok: false, error: e.message }));
+      return send(res, 200, r.ok ? { ok: true, path: f } : { ok: false, error: r.error });
+    }
     let dir = path.join(CONF_DIR, 'uploads');
     if (tt && tt.path && fs.existsSync(tt.path)) { const root = path.join(tt.path, '.pebtree-drops'); dir = path.join(root, 'images'); if (!fs.existsSync(path.join(root, '.gitignore'))) { fs.mkdirSync(root, { recursive: true }); fs.writeFileSync(path.join(root, '.gitignore'), '*\n'); } }
     fs.mkdirSync(dir, { recursive: true });
@@ -1665,9 +2130,12 @@ const server = http.createServer(async (req, res) => {
   // Shows an image file named in a conversation, only from places sessions write screenshots to.
   if (req.method === 'GET' && url.pathname === '/api/img') {
     if (url.searchParams.get('t') !== TOKEN) return send(res, 403, { error: 'token' });
-    let f; try { f = fs.realpathSync(tilde(url.searchParams.get('path') || '')); } catch { return send(res, 404, { error: 'not found' }); }
+    // a path under another host's home is a file there (a screenshot a remote session took)
+    const rp = url.searchParams.get('path') || '', rh = [...HOSTS.values()].find((h) => !h.local && h.home && rp.startsWith(h.home + '/'));
+    if (rh) { const r = await rh.call('getFile', { path: rp }, 30000).catch(() => ({ ok: false })); if (!r.ok) return send(res, 404, { error: 'not found' }); res.writeHead(200, { 'Content-Type': r.type, 'Cache-Control': 'private, max-age=3600' }); return res.end(Buffer.from(r.b64, 'base64')); }
+    let f; try { f = fs.realpathSync(tilde(rp)); } catch { return send(res, 404, { error: 'not found' }); }
     const types = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp' }, type = types[path.extname(f).toLowerCase()];
-    const roots = [CONF_DIR, '/private/tmp', '/tmp', path.join(HOME, '.claude'), path.join(HOME, 'Desktop'), path.join(HOME, 'Downloads'), MAIN, POOL].map((r) => { try { return fs.realpathSync(r); } catch { return r; } });
+    const roots = [CONF_DIR, '/private/tmp', '/tmp', path.join(HOME, '.claude'), path.join(HOME, 'Desktop'), path.join(HOME, 'Downloads'), path.join(HOME, '.treehouse'), ...LOCAL_TOPS, MAIN, POOL].filter(Boolean).map((r) => { try { return fs.realpathSync(r); } catch { return r; } });
     if (!type || !roots.some((r) => f === r || f.startsWith(r + path.sep))) return send(res, 403, { error: 'not an image in an allowed folder' });
     let st; try { st = fs.statSync(f); } catch { return send(res, 404, { error: 'not found' }); }
     if (!st.isFile() || st.size > 30 * 1024 * 1024) return send(res, 404, { error: 'not found' });
@@ -1714,19 +2182,41 @@ const server = http.createServer(async (req, res) => {
       if (a.op === 'send') {
         const sess = state && state.sessions.find((x) => x.tree === String(a.tree));
         const text = String(a.text || '').replace(/\r/g, '').trim();
-        if (!sess || !sess.tty) return send(res, 200, { ok: false, error: 'no terminal tab found for that session' });
+        if (!sess || !sess.tty) return send(res, 200, { ok: false, error: 'no terminal found for that session' });
         if (!text || text.length > 8000) return send(res, 200, { ok: false, error: 'empty or too long' });
         // Typed into an open menu, the text is ignored and Enter picks the highlighted option (usually 1).
-        const menu = parseMenu((await readScreens([sess.tty])).get(sess.tty) || '');
+        const menu = parseMenu(await screenOf(sess));
         if (menu) {
           const free = menu.options.find((o) => o.free);
           if (free && !text.startsWith('/')) return send(res, 200, await pickMenu(sess.tree, free.n, text, menu.sig));
           return send(res, 200, { ok: false, error: `Not sent: that tab is showing a ${menu.kind === 'permission' ? 'permission prompt' : 'choice'}. Pick an option first.` });
         }
-        const out = await writeToTty(sess.tty, text);
+        const out = String(await hostOf(sess).call('write', { target: targetOf(sess), text }, 20000).catch(() => ''));
         if (out.trim() === 'ok' && !text.startsWith('/')) { if (!PENDING.has(sess.tree)) PENDING.set(sess.tree, []); PENDING.get(sess.tree).push({ text, at: Date.now() }); }
         logAction({ op: text.startsWith('/remote-control') ? 'remote' : 'reply', tree: sess.tree, label: text.slice(0, 80) });
-        return send(res, 200, out.trim() === 'ok' ? { ok: true } : { ok: false, error: 'tab not found in iTerm' });
+        return send(res, 200, out.trim() === 'ok' ? { ok: true } : { ok: false, error: `its terminal is gone${sess.local ? '' : ` (or ${sess.hostLabel} is unreachable)`}` });
+      }
+      if (a.op === 'spawn') {
+        const h = HOSTS.get(String(a.host || LOCAL_HOST));
+        if (!h) return send(res, 200, { ok: false, error: 'no such host' });
+        const r = await h.call('spawn', { kind: a.kind, repo: a.repo, prompt: a.prompt, title: a.title, session: a.session, cmd: a.cmd }, 600000).catch((e) => ({ ok: false, error: e.message }));
+        if (r.ok) logAction({ op: 'new', label: `${h.label}: ${r.session}` });
+        return send(res, 200, { ...r, host: h.id });
+      }
+      // pick a stale tree back up: its tmux session if one is left, else Claude --continue in it
+      if (a.op === 'resume-tree') {
+        const t = slow.trees.get(String(a.tree || '')), h = t && HOSTS.get(t.host);
+        if (!t || !h || !/^\d+$/.test(t.slot)) return send(res, 200, { ok: false, error: 'no such tree' });
+        const r = await h.call('spawn', { kind: 'resume', repo: t.path }, 60000).catch((e) => ({ ok: false, error: e.message }));
+        if (r.ok) logAction({ op: 'resume', tree: t.tree, label: r.existed ? `reattached ${r.session}` : `Claude --continue in ${r.session}` });
+        return send(res, 200, { ...r, host: h.id });
+      }
+      if (a.op === 'kill-term') {
+        const h = HOSTS.get(String(a.host || ''));
+        if (!h) return send(res, 200, { ok: false, error: 'no such host' });
+        const r = await h.call('kill', { session: String(a.session || '') }).catch((e) => ({ ok: false, error: e.message }));
+        if (r.ok) logAction({ op: 'end', label: `${h.label}: ${a.session}` });
+        return send(res, 200, r);
       }
       if (a.op === 'uiprefs') {
         for (const [k, v] of Object.entries(a.set || {})) {
@@ -1738,12 +2228,12 @@ const server = http.createServer(async (req, res) => {
       }
       if (a.op === 'menu') return send(res, 200, await pickMenu(String(a.tree), a.n, a.text, a.sig));
       if (a.op === 'answer') return send(res, 200, await answerAsk(String(a.tree), a.answers));
-      if (a.op === 'spinoff') return send(res, 200, await spinoff({ task: a.task, title: a.title }));
+      if (a.op === 'spinoff') return send(res, 200, await spinoff({ task: a.task, title: a.title, from: a.from, host: a.host, repo: a.repo }));
       if (a.op === 'captain-start') return send(res, 200, await startCaptain(a.objectives));
       if (a.op === 'ticket-status') { if (!['new', 'triaged', 'in_progress', 'done', 'wont_do'].includes(a.status)) return send(res, 200, { ok: false, error: 'bad status' }); try { const t = await tkPatch(String(a.id), { status: a.status }); logAction({ op: 'ticket', label: `"${String(t.title).slice(0, 40)}" -> ${a.status}` }); return send(res, 200, { ok: true, ticket: t }); } catch (e) { return send(res, 200, { ok: false, error: e.message }); } }
       if (a.op === 'ticket-notes') { try { const t = await tkPatch(String(a.id), { notes: String(a.notes || '').slice(0, 4000) }); return send(res, 200, { ok: true, ticket: t }); } catch (e) { return send(res, 200, { ok: false, error: e.message }); } }
       if (a.op === 'ticket-start') return send(res, 200, await startTicket(String(a.id)));
-      if (a.op === 'drops-delete') return send(res, 200, deleteDrops(String(a.tree), String(a.id || '')));
+      if (a.op === 'drops-delete') return send(res, 200, await deleteDrops(String(a.tree), String(a.id || '')));
       if (a.op === 'sim-reload') {
         const port = +a.port;
         if (!(port > 1023 && port < 65536)) return send(res, 200, { ok: false, error: 'no Metro port' });
@@ -1755,13 +2245,16 @@ const server = http.createServer(async (req, res) => {
         // a path from the chat: show it in Finder (reveal) or open it with its default app
         let f = String(a.path || '').trim().replace(/^~(?=\/)/, HOME).replace(/[.,;:!?)]+$/, '');
         if (!f.startsWith('/')) return send(res, 200, { ok: false, error: 'not a full path' });
+        const rh = [...HOSTS.values()].find((h) => !h.local && h.home && f.startsWith(h.home + '/'));
+        if (rh) return send(res, 200, { ok: false, error: `that is on ${rh.label}; copy the path instead` });
         while (f.length > 1 && !fs.existsSync(f)) f = path.dirname(f); // a path to something gone: show the nearest folder that exists
         await run('open', a.reveal ? ['-R', f] : [f]);
         return send(res, 200, { ok: true, path: f });
       }
       if (a.op === 'drops-reveal') {
-        const t = a.tree === 'main' ? { path: MAIN } : slow.trees.get(String(a.tree)), id = String(a.id || '');
+        const t = slow.trees.get(String(a.tree)), id = String(a.id || '');
         if (!t || !t.path || !/^[\w-]{3,60}$/.test(id)) return send(res, 200, { ok: false, error: 'no such drop' });
+        if (!t.local) return send(res, 200, { ok: false, error: `that drop is on ${(HOSTS.get(t.host) || {}).label}` });
         const dir = path.join(t.path, '.pebtree-drops', id);
         if (!fs.existsSync(dir)) return send(res, 200, { ok: false, error: 'that drop is gone' });
         // select the dropped item itself when there is one, else open the drop's folder
@@ -1774,27 +2267,29 @@ const server = http.createServer(async (req, res) => {
       if (a.op === 'close-tree') return send(res, 200, await closeTree(String(a.tree), !!a.discard));
       if (a.op === 'rename') {
         const sess = state && state.sessions.find((x) => x.tree === String(a.tree));
-        const claude = sess && state.services.get && [...state.services.values()].find((v) => v.kind === 'claude' && v.tree === sess.tree);
         const name = String(a.name || '').replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 60);
-        if (!claude) return send(res, 200, { ok: false, error: 'no Claude session in that tree' });
+        if (!sess || !sess.pid) return send(res, 200, { ok: false, error: 'no Claude session in that tree' });
         if (!name) return send(res, 200, { ok: false, error: 'name is empty' });
-        customTitles = Object.fromEntries(Object.entries(customTitles).filter(([pid]) => [...state.services.values()].some((v) => String(v.id) === pid)));
-        customTitles[claude.id] = { name, at: Date.now() };
+        // names are kept per Claude process (<host>:<pid>), so a new session in the tree starts fresh
+        const live = new Set(state.sessions.map((x) => `${x.host}:${x.pid}`));
+        customTitles = Object.fromEntries(Object.entries(customTitles).filter(([k]) => live.has(k)));
+        customTitles[`${sess.host}:${sess.pid}`] = { name, at: Date.now() };
         try { fs.mkdirSync(CONF_DIR, { recursive: true }); fs.writeFileSync(TITLES_FILE, JSON.stringify(customTitles, null, 2)); } catch { /* best effort */ }
         // /rename runs immediately in Claude Code, even mid-task, and its title then drives the tab name
-        const out = claude.tty ? await writeToTty(claude.tty, `/rename ${name}`) : '';
+        const out = sess.tty ? String(await hostOf(sess).call('write', { target: targetOf(sess), text: `/rename ${name}` }).catch(() => '')) : '';
         logAction({ op: 'rename', tree: sess.tree, label: name });
-        return send(res, 200, { ok: true, tab: out.trim() === 'ok', tabNamed: tabNames.has(claude.tty) });
+        return send(res, 200, { ok: true, tab: out.trim() === 'ok', tabNamed: sess.tabNamed });
       }
       if (a.op === 'focus') {
         const sess = state && state.sessions.find((x) => x.tree === String(a.tree));
-        if (!sess || !sess.tty) return send(res, 200, { ok: false, error: 'no terminal tab found for that session' });
+        if (!sess || !sess.tty) return send(res, 200, { ok: false, error: 'no terminal found for that session' });
+        if (sess.term === 'tmux') return send(res, 200, { ok: true, term: { host: sess.host, session: sess.tmuxSession } }); // the page opens its own terminal
         const script = `tell application "iTerm2"
   activate
   repeat with w in windows
     repeat with t in tabs of w
       repeat with s in sessions of t
-        if tty of s is "/dev/${sess.tty}" then
+        if tty of s is "/dev/${sess.ttyName}" then
           select w
           select t
           select s
@@ -1847,6 +2342,173 @@ end tell`;
   send(res, 404, { error: 'not found' });
 });
 
+// ---- terminals in the page: xterm.js on a WebSocket, attached to a tmux session here or on another host.
+// xterm.js comes from jsDelivr once, is checked against these hashes, and is kept in ~/.config/pebtree/vendor.
+const VENDOR = {
+  'xterm.js': ['https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js', 'text/javascript', '1f991ac3b4b283ebf96e60ae23a00a52765dd3a2e46fa6fdda9f1aab032f7495'],
+  'xterm.css': ['https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css', 'text/css', 'ba8e6985669488981ccf40c0cefe3aba80722cb6c92de7ad628b0bd717faf2b6'],
+  'xterm-fit.js': ['https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js', 'text/javascript', 'bdaefa370b1bfc42ee88d46fe6072400902a4d4b2d45cd93438dda9b23c97089'],
+};
+async function serveVendor(res, name) {
+  const v = VENDOR[name];
+  if (!v) return send(res, 404, { error: 'not found' });
+  const f = path.join(CONF_DIR, 'vendor', name);
+  if (!fs.existsSync(f)) {
+    try {
+      const r = await fetch(v[0]); if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const body = Buffer.from(await r.arrayBuffer());
+      if (crypto.createHash('sha256').update(body).digest('hex') !== v[2]) throw new Error('it does not match the pinned hash');
+      fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, body);
+    } catch (e) { return send(res, 502, { error: `could not fetch ${name}: ${e.message}` }); }
+  }
+  res.writeHead(200, { 'Content-Type': `${v[1]}; charset=utf-8`, 'Cache-Control': 'private, max-age=86400' });
+  fs.createReadStream(f).pipe(res);
+}
+
+// A pty for `tmux attach` (Node has none built in): forks the command on a pty, copies bytes both ways, and takes
+// "<cols> <rows>" lines on fd 3 to resize it. Closing its stdin hangs up the client, which only detaches from tmux.
+const PTY_PY = String.raw`
+import os, pty, sys, select, fcntl, termios, struct, signal
+cols, rows, argv = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3:]
+pid, fd = pty.fork()
+if pid == 0:
+    try:
+        os.execvp(argv[0], argv)
+    except Exception as e:
+        sys.stderr.write('pebtree: %s: %s\r\n' % (argv[0], e))
+        os._exit(127)
+def size(c, r):
+    try:
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', r, c, 0, 0))
+    except OSError:
+        pass
+def put(f, d):
+    while d:
+        d = d[os.write(f, d):]
+size(cols, rows)
+fds, buf = [0, fd, 3], b''
+while True:
+    try:
+        r = select.select(fds, [], [])[0]
+    except InterruptedError:
+        continue
+    if fd in r:
+        try:
+            d = os.read(fd, 65536)
+        except OSError:
+            d = b''
+        if not d:
+            break
+        put(1, d)
+    if 0 in r:
+        d = os.read(0, 65536)
+        if d:
+            put(fd, d)
+        else:
+            fds.remove(0)
+            os.kill(pid, signal.SIGHUP)
+    if 3 in r:
+        d = os.read(3, 4096)
+        if not d:
+            fds.remove(3)
+            continue
+        buf += d
+        while b'\n' in buf:
+            line, buf = buf.split(b'\n', 1)
+            try:
+                c, rr = [int(x) for x in line.split()]
+            except ValueError:
+                continue
+            size(c, rr)
+            try:
+                os.kill(pid, signal.SIGWINCH)
+            except OSError:
+                pass
+try:
+    st = os.waitpid(pid, 0)[1]
+except ChildProcessError:
+    st = 0
+sys.exit(os.WEXITSTATUS(st) if os.WIFEXITED(st) else 1)
+`;
+
+// The few WebSocket frames a terminal needs (RFC 6455): client frames arrive masked, ours go unmasked.
+function wsSend(socket, data, op = 2) {
+  const len = data.length;
+  let head;
+  if (len < 126) head = Buffer.from([0x80 | op, len]);
+  else if (len < 65536) { head = Buffer.alloc(4); head[0] = 0x80 | op; head[1] = 126; head.writeUInt16BE(len, 2); }
+  else { head = Buffer.alloc(10); head[0] = 0x80 | op; head[1] = 127; head.writeBigUInt64BE(BigInt(len), 2); }
+  socket.write(Buffer.concat([head, data]));
+}
+function wsReader(onMessage, onClose, onPing) {
+  let buf = Buffer.alloc(0), parts = [], partOp = 0;
+  return (chunk) => {
+    buf = Buffer.concat([buf, chunk]);
+    for (;;) {
+      if (buf.length < 2) return;
+      const fin = buf[0] & 0x80, op = buf[0] & 0x0f, masked = buf[1] & 0x80;
+      let len = buf[1] & 0x7f, off = 2;
+      if (len === 126) { if (buf.length < 4) return; len = buf.readUInt16BE(2); off = 4; }
+      else if (len === 127) { if (buf.length < 10) return; len = Number(buf.readBigUInt64BE(2)); off = 10; }
+      if (len > 4 * 1024 * 1024) return onClose();
+      const maskAt = off; if (masked) off += 4;
+      if (buf.length < off + len) return;
+      let data = Buffer.from(buf.subarray(off, off + len));
+      if (masked) for (let i = 0; i < data.length; i++) data[i] ^= buf[maskAt + (i & 3)];
+      buf = buf.subarray(off + len);
+      if (op === 8) return onClose();
+      if (op === 9) { onPing(data); continue; }
+      if (op === 0 || op === 1 || op === 2) {
+        if (op) partOp = op;
+        parts.push(data);
+        if (fin) { const msg = Buffer.concat(parts); parts = []; onMessage(msg, partOp); }
+      }
+    }
+  };
+}
+const TERMS = new Set();
+function openTerminal(socket, h, session, cols, rows) {
+  const attach = ['tmux', '-u', 'attach-session', '-t', `=${session}`];
+  const cmd = h.local ? attach : ['ssh', '-tt', ...sshOpts.filter((o, i, a) => o !== 'BatchMode=yes' && a[i + 1] !== 'BatchMode=yes'), h.ssh, attach.join(' ')];
+  const py = spawn('python3', ['-c', PTY_PY, String(cols), String(rows), ...cmd], { stdio: ['pipe', 'pipe', 'pipe', 'pipe'], env: { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor' } });
+  const t = { host: h.id, session, at: Date.now() };
+  TERMS.add(t);
+  let closed = false;
+  const end = () => {
+    if (closed) return; closed = true; TERMS.delete(t);
+    try { py.stdin.end(); } catch { /* gone */ }
+    setTimeout(() => { try { py.kill('SIGHUP'); } catch { /* gone */ } }, 1500).unref();
+    try { wsSend(socket, Buffer.alloc(0), 8); socket.end(); } catch { /* gone */ }
+  };
+  const out = (d) => { try { wsSend(socket, d, 2); } catch { end(); } };
+  py.stdout.on('data', out); py.stderr.on('data', out);
+  py.on('exit', (code) => { try { wsSend(socket, Buffer.from(JSON.stringify({ exit: code })), 1); } catch { /* gone */ } end(); });
+  py.on('error', (e) => { out(Buffer.from(`\r\n[pebtree] could not start a terminal (python3 is needed): ${e.message}\r\n`)); end(); });
+  for (const s of [py.stdin, py.stdio[3]]) s.on('error', () => {});
+  socket.on('data', wsReader((msg, op) => {
+    if (op === 2) { py.stdin.write(msg); return; }
+    let m; try { m = JSON.parse(msg.toString('utf8')); } catch { return; }
+    if (typeof m.i === 'string') py.stdin.write(m.i);
+    if (Array.isArray(m.r)) py.stdio[3].write(`${Math.max(10, m.r[0] | 0)} ${Math.max(4, m.r[1] | 0)}\n`);
+  }, end, (data) => { try { wsSend(socket, data, 10); } catch { /* gone */ } }));
+  socket.on('close', end); socket.on('error', end);
+}
+server.on('upgrade', (req, socket) => {
+  const url = new URL(req.url, 'http://localhost'), host = (req.headers.host || '').split(':')[0], origin = req.headers.origin || '';
+  const deny = (why) => { try { socket.end(`HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\n\r\n${why}`); } catch { /* gone */ } };
+  if (host !== 'localhost' && host !== '127.0.0.1') return deny('host');
+  // only this page: a page on another site sends its own Origin, and does not have the token
+  if (origin && !/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) return deny('origin');
+  if (url.pathname !== '/api/term' || url.searchParams.get('t') !== TOKEN) return deny('token');
+  if (lockOn() && LOCK.locked) return deny('locked');
+  const h = HOSTS.get(url.searchParams.get('host') || ''), session = url.searchParams.get('session') || '', key = req.headers['sec-websocket-key'];
+  if (!h || !SAFE_NAME.test(session) || !key) return deny('bad request');
+  socket.write(['HTTP/1.1 101 Switching Protocols', 'Upgrade: websocket', 'Connection: Upgrade', `Sec-WebSocket-Accept: ${crypto.createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64')}`, '', ''].join('\r\n'));
+  socket.setNoDelay(true);
+  LOCK.lastActivity = Date.now();
+  openTerminal(socket, h, session, +url.searchParams.get('cols') || 120, +url.searchParams.get('rows') || 36);
+});
+
 async function loop(fn, ms) {
   for (;;) {
     const t = Date.now();
@@ -1876,21 +2538,24 @@ function doctorCli() {
   let bad = 0; const ok = (good, what, fix) => { console.log(`${good ? '  ok ' : ' FAIL'}  ${what}${good || !fix ? '' : `\n         fix: ${fix}`}`); if (!good) bad++; };
   const which = (b) => sh('/bin/sh', ['-c', `command -v ${b}`]);
   console.log(`pebtree doctor (config: ${fs.existsSync(CONFIG_FILE) ? CONFIG_FILE : 'none, using defaults'})\n`);
-  ok(process.platform === 'darwin', 'macOS', 'pebtree reads iTerm2 and macOS memory stats; it runs on macOS only');
+  ok(process.platform === 'darwin', 'macOS', 'the dashboard reads macOS memory stats; other machines join as hosts (config.json "hosts")');
   ok(+process.versions.node.split('.')[0] >= 18, `Node ${process.versions.node} (18 or newer)`, 'brew install node');
-  ok(sh('mdfind', ['kMDItemCFBundleIdentifier == com.googlecode.iterm2']) || fs.existsSync('/Applications/iTerm.app'), 'iTerm2 installed', 'brew install --cask iterm2; run your Claude sessions in iTerm2 tabs');
-  ok(sh('osascript', ['-e', 'tell application "iTerm2" to count windows']) !== null, 'allowed to script iTerm2 (Automation permission)', 'System Settings > Privacy & Security > Automation: allow your terminal to control iTerm2, then rerun');
+  ok(!!which('tmux'), 'tmux (sessions pebtree starts run in it)', 'brew install tmux');
+  ok(!!which('python3'), 'python3 (gives the page\'s terminals a pty)', 'xcode-select --install');
+  if (fs.existsSync('/Applications/iTerm.app')) ok(sh('osascript', ['-e', 'tell application "iTerm2" to count windows']) !== null, 'allowed to script iTerm2, for sessions still in iTerm tabs (Automation permission)', 'System Settings > Privacy & Security > Automation: allow your terminal to control iTerm2, then rerun');
+  else console.log('  --    iTerm2: not installed (only sessions in tmux are followed)');
   ok(!!which('claude'), 'Claude Code CLI on PATH', 'npm i -g @anthropic-ai/claude-code');
   ok(fs.existsSync(path.join(HOME, '.claude/projects')), '~/.claude/projects (session transcripts)', 'start one Claude Code session so it is created');
   ok(!!which('treehouse'), 'treehouse CLI on PATH', 'install treehouse (the git worktree pool manager pebtree is built around)');
-  ok(!!sh('git', ['-C', MAIN, 'rev-parse', '--git-dir']), `main checkout ${MAIN}`, 'pebtree init --main <your repo checkout>');
-  ok(fs.existsSync(POOL), `treehouse pool ${POOL}`, 'create a tree with `treehouse get`, then `pebtree init`');
-  ok(!!sh('treehouse', ['status'], MAIN), '`treehouse status` runs in the main checkout', 'run `treehouse init` in the repo');
+  ok(!!which('gh') && sh('gh', ['auth', 'status']) !== null, 'gh, logged in (PR status for every repo)', 'brew install gh && gh auth login');
+  for (const h of HOSTS.values()) {
+    if (h.local) continue;
+    const r = sh('ssh', [...sshOpts, h.ssh, 'PATH="$HOME/.local/bin:$HOME/bin:/usr/local/bin:$PATH"; command -v node tmux treehouse claude; node -v']) || '';
+    ok(/node/.test(r) && /tmux/.test(r), `host ${h.id} (ssh ${h.ssh}): node and tmux${/treehouse/.test(r) ? ', treehouse' : ''}${/claude/.test(r) ? ', claude' : ''}`, r ? 'install node 18+ and tmux there' : `\`ssh ${h.ssh}\` must work without a prompt (a key in the agent or keychain)`);
+  }
+  if (MAIN) ok(!!sh('git', ['-C', MAIN, 'rev-parse', '--git-dir']), `main checkout ${MAIN} (journal, captain)`, 'pebtree init --main <your repo checkout>, or remove "main" from config.json');
   const td = TEARDOWN && TEARDOWN.split(/\s+/)[0];
   ok(!td || !!which(td), `teardown command: ${TEARDOWN || '(none)'}`, 'put it on PATH, or set "teardown" in config.json ("" to skip)');
-  const remote = sh('git', ['-C', MAIN, 'remote', 'get-url', 'origin']) || '';
-  ok(/github\.com/.test(remote), `GitHub remote (${remote || 'none'})`, 'PR status needs a GitHub origin');
-  ok(!!which('npx'), 'npx (runs gh-axi for PR status)', 'comes with Node');
   if (TK.url || TK.key) {
     ok(!!(TK.url && TK.key), 'tickets: url and key in config.json', 'set "tickets": { "url": "https://your-app.example.com", "key": "<PEBTREE_API_KEY>" }');
     if (TK.url && TK.key) { let code = null; try { code = require('child_process').execFileSync('curl', ['-s', '-o', '/dev/null', '-w', '%{http_code}', '-m', '15', '-H', '@-', `${TK.url}/api/engineering/tickets?limit=1`], { input: `Authorization: Bearer ${TK.key}\n`, encoding: 'utf8', timeout: 20000 }).trim(); } catch { /* no answer: the key goes in on stdin, never on the command line */ } ok(code === '200', `tickets API answers (${code || 'no response'})`, code === '401' ? 'the key does not match PEBTREE_API_KEY on the server' : code === '503' ? 'the server has no PEBTREE_API_KEY yet: set it and redeploy' : /^30/.test(code || '') ? 'the url redirects (a redirect drops the key): use the address it redirects to (often the www. one)' : 'check the url, and that PEBTREE_API_KEY is set on the server'); }
@@ -1912,13 +2577,36 @@ function ticketsKeyCli(argv) {
   console.log(`Saved the tickets key (${key.length} characters, ending ...${key.slice(-4)}) and url ${url} to ${CONFIG_FILE} (owner-only).`);
   console.log('Restart pebtree to use it, then run `pebtree doctor` to check the API accepts it. You can clear your clipboard now.');
 }
-if (process.argv[2] === 'tickets-key') ticketsKeyCli(process.argv.slice(3));
+// `pebtree new <preset>` or `pebtree new <host> <kind> [repo] [--prompt "..."]`: starts it through the running dashboard
+// (which holds the ssh connections), then attaches this terminal to it, the way `tw` did.
+async function newCli(argv) {
+  const pos = [], opt = { prompt: '', attach: true };
+  for (let i = 0; i < argv.length; i++) { if (argv[i] === '--prompt') opt.prompt = argv[++i] || ''; else if (argv[i] === '--no-attach') opt.attach = false; else pos.push(argv[i]); }
+  const pre = presets().find((p) => p.id === pos[0]);
+  const spec = pre ? { ...pre } : { host: pos[0], kind: pos[1], repo: pos[2] || '~' };
+  if (!spec.host || !spec.kind) {
+    console.log(`usage: pebtree new <preset> [--prompt "..."]      presets: ${presets().map((p) => p.id).join(', ') || '(none in config.json)'}\n       pebtree new <host> <tree|claude|codex|shell> [repo] [--prompt "..."] [--no-attach]      hosts: ${[...HOSTS.keys()].join(', ')}`);
+    process.exit(1);
+  }
+  let r;
+  try { r = await (await fetch(`http://127.0.0.1:${PORT}/api/action`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...spec, op: 'spawn', prompt: opt.prompt || spec.prompt || '', token: fs.readFileSync(path.join(CONF_DIR, 'token'), 'utf8').trim() }) })).json(); }
+  catch { console.error(`pebtree is not running (start it with \`pebtree\`)`); process.exit(1); }
+  if (!r.ok) { console.error(`pebtree new: ${r.error}`); process.exit(1); }
+  console.log(`${r.existed ? 'attaching to' : 'started'} ${r.session} on ${(HOSTS.get(spec.host) || {}).label || spec.host}${r.path ? ` in ${r.path}` : ''}`);
+  if (!opt.attach || !process.stdout.isTTY) process.exit(0);
+  const h = HOSTS.get(spec.host), attach = ['tmux', '-u', 'attach-session', '-t', `=${r.session}`];
+  const c = h && !h.local ? spawn('ssh', ['-t', h.ssh, attach.join(' ')], { stdio: 'inherit' }) : spawn(attach[0], attach.slice(1), { stdio: 'inherit' });
+  c.on('exit', (code) => process.exit(code || 0));
+}
+if (AGENT) agentMain();
+else if (process.argv[2] === 'new') newCli(process.argv.slice(3));
+else if (process.argv[2] === 'tickets-key') ticketsKeyCli(process.argv.slice(3));
 else if (process.argv[2] === 'init') initCli(process.argv.slice(3));
 else if (process.argv[2] === 'doctor') doctorCli();
 else if (process.argv[2] === 'proof') proofCli(process.argv.slice(3));
 else if (process.argv[2] === 'spinoff') spinoffCli(process.argv.slice(3));
-else if (!MAIN || !POOL) { console.error('pebtree is not set up yet: run `pebtree init` in your project\'s main checkout (see docs/pebtree.md), then `pebtree doctor`.'); process.exit(1); }
 else (async () => {
+  for (const h of HOSTS.values()) if (!h.local) hostLoop(h);
   loop(journalTick, 60000);
   await refreshSlow().catch((e) => console.error(e));
   loop(refreshFast, FAST_MS);
@@ -2412,10 +3100,39 @@ html[data-style=valorant] body :is(.ticon svg,.okdot,.offdot,.dots i,.spin,.tico
 [data-style=valorant] a{color:#FF7C87}
 [data-style=valorant] nav a{color:var(--muted)!important}[data-style=valorant] nav a:hover{color:var(--ink)!important}[data-style=valorant] nav a.on{color:#fff!important}
 [data-style=valorant] .post-head .tname{font-family:Oswald,var(--sans);text-transform:uppercase;letter-spacing:.05em;font-weight:600}
+
+.termwrap{display:grid;grid-template-columns:300px 1fr;gap:12px;height:calc(100vh - 96px);min-height:420px}
+.termside{overflow:auto;padding:12px 12px 16px;display:flex;flex-direction:column;gap:14px}
+.termside .tshead{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--faint);margin:0 0 6px;display:flex;align-items:center;gap:6px}
+.termside .tspresets{display:flex;flex-wrap:wrap;gap:6px}
+.tsterm,.tsstale{display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:8px;cursor:pointer;min-width:0}
+.tsterm:hover,.tsterm.on{background:var(--sunk)}
+.tsterm b,.tsstale b{font-size:12.5px;font-weight:600}
+.tsstale{cursor:default;align-items:flex-start;background:var(--panel2);margin-bottom:6px}
+.tsstale button{padding:3px 8px;font-size:12px}
+.tsclip{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:190px}
+.tsstale .tsclip{white-space:normal;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.grow{flex:1;min-width:0}
+.tsdot{width:8px;height:8px;border-radius:50%;background:var(--other);flex:none}
+.tsdot.ok{background:var(--ok)}.tsdot.bad{background:var(--bad)}.tsdot.claude{background:var(--wait)}.tsdot.work{background:var(--work)}
+.termmain{display:flex;flex-direction:column;min-width:0;padding:0!important;overflow:hidden}
+.termtabs{display:flex;gap:4px;padding:6px;border-bottom:1px solid var(--line);overflow-x:auto;flex:none;min-height:38px;align-items:center}
+.termtab{display:flex;align-items:center;gap:6px;padding:4px 4px 4px 8px;border-radius:7px;cursor:pointer;white-space:nowrap;font-size:12px;color:var(--muted)}
+.termtab.on{background:var(--sunk);color:var(--ink)}
+.termtab .xbtn,.tsterm .xbtn{width:20px;height:20px;padding:0;font-size:14px;line-height:1;opacity:.55}
+.termtab .xbtn:hover,.tsterm .xbtn:hover{opacity:1}
+.termhost{flex:1;position:relative;background:#0b0e14;min-height:0}
+.termhost .xt{position:absolute;inset:8px;display:none}.termhost .xt.on{display:block}
+.termempty{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#7B88A1;text-align:center;gap:6px;font-size:13px}
+.nsgrid{display:grid;grid-template-columns:90px 1fr;gap:10px 12px;align-items:center}
+.nsgrid label{font-size:12px;color:var(--muted)}
+.nsgrid .seg{flex-wrap:wrap}
+@media (max-width:900px){.termwrap{grid-template-columns:1fr;height:auto}.termmain{height:70vh}}
 </style></head><body>
 <nav>
   <div class="brand"><img id="brandlogo" class="brandlogo" alt=""><span class="lbl brandname">pebtree</span><button id="navToggle" class="iconbtn" title="Collapse sidebar"><svg viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg></button></div>
   <a href="#overview" data-v="overview" title="Overview"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></svg><span class="lbl">Overview</span><span class="count turn" id="c-turn"></span></a>
+  <a href="#terms" data-v="terms" title="Terminals"><svg viewBox="0 0 24 24"><rect x="3" y="4.5" width="18" height="15" rx="2.5"/><path d="M7 10l3 2.5L7 15M12.5 15H17"/></svg><span class="lbl">Terminals</span><span class="count" id="c-terms"></span></a>
   <a href="#resources" data-v="resources" title="Resources"><svg viewBox="0 0 24 24"><path d="M3 3v18h18"/><path d="M7 15l4-5 3 3 5-7"/></svg><span class="lbl">Resources</span></a>
   <a href="#trees" data-v="trees" title="Trees"><svg viewBox="0 0 24 24"><path d="M6 3v12"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg><span class="lbl">Trees</span><span class="count" id="c-trees"></span></a>
   <a href="#processes" data-v="processes" title="Processes"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M13 15h4"/></svg><span class="lbl">Processes</span><span class="count" id="c-procs"></span></a>
@@ -2432,6 +3149,7 @@ html[data-style=valorant] body :is(.ticon svg,.okdot,.offdot,.dots i,.spin,.tico
   <main>
     <span id="alerthome" hidden></span><div id="alert"></div>
     <section class="view" id="v-overview"><div class="cols2 panes"><div class="col feedcol"><div id="yourturn"></div></div><div class="col dashcol"><div class="tiles" id="tiles"></div><div class="panel"><div class="ptitle"><b>TreeMemory</b><span class="v" id="ov-mem-v"></span><div class="seg mini memMode"><button data-memmode="chart" title="Memory each tree used over the chart history period">Over time</button><button data-memmode="bars" title="Memory each tree is using right now">Right now</button></div></div><div class="chartrow" id="ov-mem-chartrow"><div class="chart" id="ch-ov-mem"></div><div class="vlegend" id="ov-mem-legend"></div></div><div class="hbars" id="ov-mem-bars"></div></div><div class="panel"><div class="ptitle"><b>Swap and compressed memory</b><span class="info" tabindex="0">i<span class="infotip">When the Mac needs more than its RAM, macOS first squeezes idle memory into a compressed form (compressed), then writes it out to disk (swap). A little is normal. Gigabytes of swap mean the Mac keeps reading memory back from disk, which is the lag you feel. Stopping dev servers is the quickest way to bring it down.</span></span></div><div class="chart" id="ch-ov-swapcpu"></div></div><div class="panel"><div class="ptitle"><b>Trees</b><span class="v muted">sorted by tree</span></div><div id="ov-trees"></div></div></div></div></section>
+    <section class="view" id="v-terms"><div class="termwrap"><div class="panel termside" id="termside"></div><div class="panel termmain"><div class="termtabs" id="termtabs"></div><div class="termhost" id="termhost"><div class="termempty" id="termempty">Pick a session on the left, or start a new one.<br><span class="small">Closing a tab here only detaches; the session keeps running in tmux, on its host.</span></div></div></div></div></section>
     <section class="view" id="v-resources"><div class="g2"><div class="panel"><div class="ptitle"><b>TreeMemory</b><span class="v"></span><div class="seg mini memMode"><button data-memmode="chart" title="Memory each tree used over the chart history period">Over time</button><button data-memmode="bars" title="Memory each tree is using right now">Right now</button></div></div><div class="chart" id="ch-mem-tree"></div><div class="hbars" id="res-mem-bars"></div></div><div class="panel"><div class="ptitle"><b>System memory</b></div><div class="chart" id="ch-mem-sys"></div></div><div class="panel"><div class="ptitle"><b>CPU</b><span class="v" id="cpu-v"></span></div><div class="chart" id="ch-cpu"></div></div><div class="panel"><div class="ptitle"><b>CPU by tree</b><span class="v muted">% of one core</span></div><div class="chart" id="ch-cpu-tree"></div></div><div class="panel"><div class="ptitle"><b>Dev servers running</b></div><div class="chart" id="ch-servers"></div></div><div class="panel"><div class="ptitle"><b>Claude sessions working</b></div><div class="chart" id="ch-working"></div></div></div><div class="panel resnow"><div class="ptitle"><b>Memory now</b><span class="v" id="res-now-v"></span></div><div class="bar" id="res-bar"></div><div class="legend" id="res-legend"></div></div><div class="panel"><div class="ptitle" data-rid="res-table"><b>Per tree over time</b></div><div id="res-table"></div></div></section>
     <section class="view" id="v-sessions"><div id="sessions-wrap" style="display:flex;flex-direction:column;gap:10px"></div></section>
     <section class="view" id="v-trees"><div class="panel" id="pool"></div><div class="panel" id="slots"></div></section>
@@ -2459,7 +3177,13 @@ function maybeReload(build){if(!build||build===BUILD)return;var b=$('updbtn');if
   if(document.hidden||Date.now()-LASTINPUT>60000)doReload()}
 document.addEventListener('visibilitychange',function(){if(document.hidden&&S&&S.build&&S.build!==BUILD)maybeReload(S.build)});
 var PALETTE=['#88C0D0','#D08770','#A3BE8C','#B48EAD','#EBCB8B','#5E81AC','#BF616A','#8FBCBB','#81A1C1','#C9826B','#7FA36A','#9A7598','#D4B262','#4C6E96','#A4505A','#6FA6A3','#A7C9D9','#E0A48A','#BED3A8','#CDB0C8'];
-function colorFor(t){return t==='main'?'#7B88A1':PALETTE[((parseInt(t,10)||1)-1)%PALETTE.length]}
+// Trees and sessions are "<host>:<repo>:<slot>" (slot: a pool number, main for a checkout, dir for a plain folder);
+// S.ids names each one ("cbc-ditto 24") and says which host it is on.
+function idMeta(t){return (S&&S.ids&&S.ids[t])||null}
+function slotOf(t){var m=idMeta(t);if(m)return m.slot;var p=String(t).split(':');return p.length>2?p[2]:String(t)}
+function hashT(t){var h=0;t=String(t);for(var i=0;i<t.length;i++)h=(h*31+t.charCodeAt(i))|0;return Math.abs(h)}
+function isMainT(t){var s=slotOf(t);return t==='main'||s==='main'||s==='dir'}
+function colorFor(t){if(isMainT(t))return '#7B88A1';var n=parseInt(slotOf(t),10);return PALETTE[((n||hashT(t)+1)-1)%PALETTE.length]}
 function $(id){return document.getElementById(id)}
 function $H(id){return {set html(v){var e=$(id);if(e&&e._h!==v){e._h=v;e.innerHTML=v}}}}
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
@@ -2467,7 +3191,7 @@ function gb(mb){return mb>=1024?(mb/1024).toFixed(1)+' GB':Math.round(mb)+' MB'}
 function ago(t){if(!t)return 'never';var s=(Date.now()-t)/1000;if(s<60)return 'just now';if(s<3600)return Math.floor(s/60)+'m ago';if(s<86400)return Math.floor(s/3600)+'h ago';return Math.floor(s/86400)+'d ago'}
 function dur(s){return s<3600?Math.floor(s/60)+'m':s<86400?Math.floor(s/3600)+'h':Math.floor(s/86400)+'d'}
 function simPills(x){return (x.sims||[]).map(function(m){return ' <span class="pill simpill'+(m.connected?'':' off')+'" title="'+esc(m.name+' · '+m.runtime+(m.metroPort?' · Metro :'+m.metroPort:' · app not connected to a dev server'))+'"><svg viewBox="0 0 24 24"><rect x="7" y="2.5" width="10" height="19" rx="2.5"/><path d="M11 18.5h2"/></svg>'+esc(m.model)+(m.connected?'':' · not connected')+'</span>'}).join('')}
-function treeName(t){return t==='main'?'main':'tree '+t}
+function treeName(t){var m=idMeta(t);if(m)return m.label+(m.local?'':' · '+m.hostLabel);var p=String(t).split(':');if(p.length>2){var loc=S&&S.hosts&&S.hosts.some(function(h){return h.local&&h.id===p[0]});return (p[2]==='main'||p[2]==='dir'?p[1]:p[1]+' '+p[2])+(loc?'':' · '+p[0])}return t==='main'?'main':'tree '+t}
 var S=null,COARSE=[],coarseAt=0,CR=(function(){try{return JSON.parse(lsGet('treehouse-chart-ranges')||'{}')}catch(e){return {}}})(),view=(location.hash||'#overview').slice(1);
 // Layout prefs live on the dashboard server (window.__UI) so any browser or window gets them; localStorage is only a fallback.
 function lsGet(k){if(Object.prototype.hasOwnProperty.call(window.__UI,k))return window.__UI[k];try{return localStorage.getItem(k)}catch(e){return null}}
@@ -2643,9 +3367,9 @@ var SPECIES=[
  ['aspen',"<rect x='30' y='28' width='4' height='26' fill='#ECEFF4' stroke='#D8DEE9'/><ellipse cx='32' cy='20' rx='10' ry='15' fill='#EBCB8B'/><ellipse cx='29' cy='17' rx='4' ry='7' fill='#F2D99A'/>"],
  ['fir',"<rect x='30' y='46' width='4' height='8' fill='"+TK+"'/><path d='M32 6 L46 46 H18Z' fill='#4C7A5A'/><path d='M32 14 L40 38 H24Z' fill='#5E8C61'/>"]
 ];
-function treeArt(t){var i=t==='main'?0:(((parseInt(t,10)||1)-1)%20)+1;return SPECIES[i]}
+function treeArt(t){var i=isMainT(t)?0:(((parseInt(slotOf(t),10)||hashT(t)+1)-1)%20)+1;return SPECIES[i]}
 function treeIcon(t,size){
-  var sp=treeArt(t),c=colorFor(t),n=t==='main'?'M':t;
+  var sp=treeArt(t),c=colorFor(t),n=isMainT(t)?(String(t).split(':')[1]||'M').charAt(0).toUpperCase():slotOf(t);
   return '<span class="ticon" style="width:'+size+'px;height:'+size+'px" title="'+esc(treeName(t)+' · '+sp[0])+'"><svg viewBox="0 0 64 64" width="'+size+'" height="'+size+'"><circle cx="32" cy="32" r="32" fill="'+c+'" opacity=".28"/>'+sp[1]+'</svg>'+(size>=26?'<b style="background:'+c+'">'+n+'</b>':'')+'</span>';
 }
 function postHead(x){
@@ -2661,17 +3385,17 @@ var ICO={term:'<svg viewBox="0 0 24 24"><rect x="3" y="4.5" width="18" height="1
   stop:'<svg viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2.5"/></svg>',
   close:'<svg viewBox="0 0 24 24"><path d="M4 21V9l8-6 8 6v12M9 21v-6h6v6"/><path d="M3 3l18 18"/></svg>'};
 // The card's tools (terminal, remote, close) and its movers (pin, later, pending, move) sit in two groups with a divider between them.
-function headActs(x,inConvo){var tools='<button class="hact" data-focus="'+x.tree+'" data-tip="Open its iTerm tab">'+ICO.term+'</button>'+(x.remote?'':'<button class="hact" data-remote="'+x.tree+'" data-tip="Make remote · reach it from claude.ai or your phone">'+ICO.remote+'</button>')+(x.tree==='main'?'':'<button class="hact danger" data-closetree="'+x.tree+'" data-tip="Close tree · stop everything, close its tab">'+ICO.close+'</button>'),
+function headActs(x,inConvo){var tools='<button class="hact" data-focus="'+x.tree+'" data-tip="Open its terminal">'+ICO.term+'</button>'+(x.remote?'':'<button class="hact" data-remote="'+x.tree+'" data-tip="Make remote · reach it from claude.ai or your phone">'+ICO.remote+'</button>')+(x.tree==='main'?'':'<button class="hact danger" data-closetree="'+x.tree+'" data-tip="Close tree · stop everything, close its tab">'+ICO.close+'</button>'),
   movers='<button class="hact'+(PINS[x.tree]?' on':'')+'" data-pin="'+x.tree+'" data-tip="'+(PINS[x.tree]?'Unpin':'Pin to the top of the feed')+'"><svg viewBox="0 0 24 24"><path d="M9 4h6l-1 6 4 4H6l4-4zM12 14v7"/></svg></button>'+(inConvo?'':'<button class="hact" data-later="'+x.tree+'" data-tip="Later · move to the bottom of Your turn"><svg viewBox="0 0 24 24"><path d="M12 5v12M6 13l6 6 6-6"/></svg></button><button class="hact" data-skip="'+x.tree+'" data-tip="Pending · set aside while you wait on someone, until it says something new">'+ICO.skip+'</button>')+'<button class="hact" data-movemenu="'+x.tree+'" data-tip="Move to another section · or drag the card"><svg viewBox="0 0 24 24"><path d="M7 4v16M7 20l-3-3M7 20l3-3M17 20V4M17 4l-3 3M17 4l3 3"/></svg></button>';
   return '<div class="hacts">'+tools+'<span class="hsep"></span>'+movers+'</div>'}
 function treeActs(x){var stoppable=(x.services||[]).filter(function(v){return v.killable&&v.kind!=='claude'&&v.kind!=='mcp'}).length;
-  return '<div class="hacts">'+(x.tty?'<button class="hact" data-focus="'+x.tree+'" data-tip="Open its iTerm tab">'+ICO.term+'</button>':'<span class="hact ghost"></span>')+
+  return '<div class="hacts">'+(x.tty?'<button class="hact" data-focus="'+x.tree+'" data-tip="Open its terminal">'+ICO.term+'</button>':'<span class="hact ghost"></span>')+
     (stoppable?'<button class="hact danger" data-stoptree="'+x.tree+'" data-tip="Stop all '+stoppable+' dev process'+(stoppable>1?'es':'')+' (Claude keeps running)">'+ICO.stop+'</button>':'<span class="hact ghost"></span>')+
     (x.tree!=='main'?'<button class="hact danger" data-closetree="'+x.tree+'" data-tip="Close tree · stop everything, close its tab">'+ICO.close+'</button>':'<span class="hact ghost"></span>')+'</div>'}
 function postTop(x){
   var topic=(x.tabNamed?x.title:humanize(x.title))||humanize(branchLabel(x.branch))||'No topic yet',asked=(x.lastUser||'').replace(/^\[Image[^\]]*\]\s*/,'');
   if(/^This session is being continued/.test(asked))asked='';
-  return '<div class="post-head" style="--tc:'+colorFor(x.tree)+'"><button class="cardchev" data-cardfold="'+x.tree+'" data-tip="Collapse or expand this card"><svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg></button>'+treeIcon(x.tree,38)+'<div class="who"><div class="l1"><b class="tname">'+treeName(x.tree)+'</b>'+capBadge(x)+(EDITING[x.tree]!==undefined?'<input class="topicedit" data-renamebox="'+x.tree+'" maxlength="60" value="'+esc(EDITING[x.tree])+'">':'<span class="topic" title="'+esc(topic)+'">'+esc(topic)+'</span>'+(x.menu&&ASKDONE[x.tree]!==x.menu.sig?'<span class="pill waiting askpill">'+(x.menu.kind==='permission'?'Permission':'Question')+'</span>':'')+'<button class="renamebtn" data-rename="'+x.tree+'" data-tip="Rename · also renames its terminal tab"><svg viewBox="0 0 24 24"><path d="M4 20h4L19 9l-4-4L4 16z"/></svg></button>')+(x.remote?'<span class="pill ok">remote</span>':'')+(subRunning(x).length?'<span class="pill agentpill" data-tip="'+esc(subRunning(x).map(function(a){return a.desc}).join(' · '))+'">'+subRunning(x).length+' subagent'+(subRunning(x).length>1?'s':'')+'</span>':'')+headActs(x,false)+'<span class="muted small when">'+(x.claudeState==='working'?'<span class="dots"><i></i><i></i><i></i></span> working · ':'waiting ')+ago(x.lastActive).replace(' ago','')+'</span></div>'+
+  return '<div class="post-head" style="--tc:'+colorFor(x.tree)+'"><button class="cardchev" data-cardfold="'+x.tree+'" data-tip="Collapse or expand this card"><svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg></button>'+treeIcon(x.tree,38)+'<div class="who"><div class="l1"><b class="tname">'+treeName(x.tree)+'</b>'+capBadge(x)+(x.hostUp===false?'<span class="pill bad" data-tip="'+esc(x.hostLabel)+' is unreachable; pebtree reconnects on its own and the session keeps running there">offline</span>':'')+(EDITING[x.tree]!==undefined?'<input class="topicedit" data-renamebox="'+x.tree+'" maxlength="60" value="'+esc(EDITING[x.tree])+'">':'<span class="topic" title="'+esc(topic)+'">'+esc(topic)+'</span>'+(x.menu&&ASKDONE[x.tree]!==x.menu.sig?'<span class="pill waiting askpill">'+(x.menu.kind==='permission'?'Permission':'Question')+'</span>':'')+'<button class="renamebtn" data-rename="'+x.tree+'" data-tip="Rename · also renames its terminal tab"><svg viewBox="0 0 24 24"><path d="M4 20h4L19 9l-4-4L4 16z"/></svg></button>')+(x.remote?'<span class="pill ok">remote</span>':'')+(subRunning(x).length?'<span class="pill agentpill" data-tip="'+esc(subRunning(x).map(function(a){return a.desc}).join(' · '))+'">'+subRunning(x).length+' subagent'+(subRunning(x).length>1?'s':'')+'</span>':'')+headActs(x,false)+'<span class="muted small when">'+(x.claudeState==='working'?'<span class="dots"><i></i><i></i><i></i></span> working · ':'waiting ')+ago(x.lastActive).replace(' ago','')+'</span></div>'+
     '<div class="l2 small muted">'+(x.branch?'<span class="br" title="'+esc(x.branch)+'"><svg viewBox="0 0 24 24"><circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="8" r="2"/><path d="M6 7v10M18 10c0 4-6 3-11 7"/></svg>'+esc(branchLabel(x.branch))+'</span>':'')+(asked?'<span class="asked" title="'+esc(asked)+'">You: '+esc(asked)+'</span>':'')+'</div></div></div>';
 }
 function pendingOf(x){var a=((SENT[x.tree]&&SENT[x.tree].msgs)||[]).slice();(x.pending||[]).forEach(function(p){if(!a.some(function(q){return q.text===p.text}))a.push(p)});return a.sort(function(a,b){return a.at-b.at})}
@@ -2724,7 +3448,7 @@ function sideHtml(x){
     sec('Servers',srv||'<div class="sdline muted">No dev servers running</div>')+
     (sims?sec('Simulators',sims):'')+
     dropsSec(x)+
-    sec('Actions','<div class="sdacts">'+(x.tty?'<button data-focus="'+x.tree+'" data-tip="Open its iTerm tab">'+ICO.term+'</button>':'')+(x.tty&&!x.remote?'<button data-remote="'+x.tree+'" data-tip="Make remote · reach it from claude.ai or your phone">'+ICO.remote+'</button>':'')+'<button data-pin="'+x.tree+'" data-tip="'+(PINS[x.tree]?'Unpin from the top of the feed':'Pin to the top of the feed')+'"'+(PINS[x.tree]?' class="on"':'')+'><svg viewBox="0 0 24 24"><path d="M9 4h6l-1 6 4 4H6l4-4zM12 14v7"/></svg></button><button data-movemenu="'+x.tree+'" data-tip="Move to another section of the feed"><svg viewBox="0 0 24 24"><path d="M7 4v16M7 20l-3-3M7 20l3-3M17 20V4M17 4l-3 3M17 4l3 3"/></svg></button>'+(svcs.some(function(v){return v.killable})?'<button class="danger" data-stoptree="'+x.tree+'" data-tip="Stop its dev servers, Metro, Jest and stray node processes. Claude keeps running.">'+ICO.stop+'</button>':'')+(x.tree!=='main'?'<button class="danger" data-closetree="'+x.tree+'" data-tip="Close tree: stop everything, end its Claude session, close its tab, return the tree">'+ICO.close+'</button>':'')+'</div>');
+    sec('Actions','<div class="sdacts">'+(x.tty?'<button data-focus="'+x.tree+'" data-tip="Open its terminal">'+ICO.term+'</button>':'')+(x.tty&&!x.remote?'<button data-remote="'+x.tree+'" data-tip="Make remote · reach it from claude.ai or your phone">'+ICO.remote+'</button>':'')+'<button data-pin="'+x.tree+'" data-tip="'+(PINS[x.tree]?'Unpin from the top of the feed':'Pin to the top of the feed')+'"'+(PINS[x.tree]?' class="on"':'')+'><svg viewBox="0 0 24 24"><path d="M9 4h6l-1 6 4 4H6l4-4zM12 14v7"/></svg></button><button data-movemenu="'+x.tree+'" data-tip="Move to another section of the feed"><svg viewBox="0 0 24 24"><path d="M7 4v16M7 20l-3-3M7 20l3-3M17 20V4M17 4l-3 3M17 4l3 3"/></svg></button>'+(svcs.some(function(v){return v.killable})?'<button class="danger" data-stoptree="'+x.tree+'" data-tip="Stop its dev servers, Metro, Jest and stray node processes. Claude keeps running.">'+ICO.stop+'</button>':'')+(x.tree!=='main'?'<button class="danger" data-closetree="'+x.tree+'" data-tip="Close tree: stop everything, end its Claude session, close its tab, return the tree">'+ICO.close+'</button>':'')+'</div>');
 }
 var LIVE_T=0,LIVEV={on:false,html:'',draft:false,dhtml:''};
 function reloadChat(tree){var h=CHAT[tree];fetch('/api/chat?tree='+encodeURIComponent(tree)+'&limit=200').then(function(r){return r.json()}).then(function(d){if(CONVO!==tree||!$('convo').open)return;var log=document.querySelector('#convo .cvlog'),atBottom=!log||log.scrollHeight-log.scrollTop-log.clientHeight<40;var add=(d.items||[]).length-h.items.length;h.items=d.items||[];if(add>0)h.n=Math.min(h.items.length,h.n+add);paintConvo(atBottom,!atBottom)})}
@@ -2930,7 +3654,7 @@ function sessionCard(x){var st=sessState(x),since=x.claudeState==='working'?'act
     (x.task?'<div class="small"><span class="pill ok" data-tip="A task on the captain\'s board">swarm</span> '+esc(x.task.title)+'</div>':'')+
     '<div class="row small muted icrow"><span class="icn" data-tip="'+esc(x.branch||'no branch')+'">'+TIC.br+'<b class="mono">'+esc(branchLabel(x.branch)||x.branch||'-')+'</b></span>'+icoNum(TIC.edit,x.dirty||0,(x.dirty||0)+' uncommitted file'+(x.dirty===1?'':'s'),x.dirty?'warn':'')+icoNum(TIC.up,x.ahead||0,(x.ahead||0)+' commit'+(x.ahead===1?'':'s')+' not on master')+icoNum(TIC.srv,(x.services||[]).filter(function(v){return v.kind!=='claude'&&v.kind!=='mcp'}).length,'Dev processes running in this tree')+'</div>'+
     (x.lastSay?'<div class="say">'+esc(tail(x.lastSay,300))+'</div>':'')+
-    '<div class="row scacts">'+(x.tty?'<button class="hact" data-focus="'+x.tree+'" data-tip="Open its iTerm tab">'+ICO.term+'</button>':'')+(x.services.some(function(v){return v.killable&&v.kind!=='claude'})?'<button class="hact danger" data-stoptree="'+x.tree+'" data-tip="Stop its dev servers (Claude keeps running)">'+ICO.stop+'</button>':'')+(x.tree!=='main'?'<button class="hact danger" data-closetree="'+x.tree+'" data-tip="Close tree: stop everything, end its Claude session, close its tab, return the tree">'+ICO.close+'</button>':'')+'</div></div>'}
+    '<div class="row scacts">'+(x.tty?'<button class="hact" data-focus="'+x.tree+'" data-tip="Open its terminal">'+ICO.term+'</button>':'')+(x.services.some(function(v){return v.killable&&v.kind!=='claude'})?'<button class="hact danger" data-stoptree="'+x.tree+'" data-tip="Stop its dev servers (Claude keeps running)">'+ICO.stop+'</button>':'')+(x.tree!=='main'?'<button class="hact danger" data-closetree="'+x.tree+'" data-tip="Close tree: stop everything, end its Claude session, close its tab, return the tree">'+ICO.close+'</button>':'')+'</div></div>'}
 document.addEventListener('click',function(e){var c=e.target.closest&&e.target.closest('[data-cardopen]');if(!c||e.target.closest('button,a,input,textarea')||String(window.getSelection()||''))return;openConvo(c.dataset.cardopen)});
 function renderSessions(){
   var groups=[['waiting','Your turn','var(--wait)'],['working','Working','var(--work)'],['idle','Idle','var(--faint)'],['none','No Claude session','var(--line)']];
@@ -2948,7 +3672,7 @@ function renderSlots(){
   var LBL={waiting:'your turn',working:'working',idle:'idle',free:'free',empty:'empty'};
   $H('slots').html='<div class="ptitle"><b>Treehouse</b><span class="v small muted">click a tree to open it · hover anything for details</span></div><div class="thgrid">'+list.map(function(t){
     var st=slotState(t),x=S.sessions.find(function(q){return q.tree===t.tree}),open=x&&x.claudeState!=='none';
-    if(st==='empty')return '<div class="th empty" data-tip="'+esc(treeName(t.tree))+' · no worktree yet; treehouse creates it when a tree is needed"><div class="thav"><span class="thnum">'+t.tree+'</span></div><div class="thname">'+treeName(t.tree)+'</div><div class="thtopic muted">empty</div></div>';
+    if(st==='empty')return '<div class="th empty" data-tip="'+esc(treeName(t.tree))+' · no worktree yet; treehouse creates it when a tree is needed"><div class="thav"><span class="thnum">'+esc(isMainT(t.tree)?'M':slotOf(t.tree))+'</span></div><div class="thname">'+treeName(t.tree)+'</div><div class="thtopic muted">empty</div></div>';
     var topic=x?((x.tabNamed?x.title:humanize(x.title))||humanize(branchLabel(x.branch))):(t.title||'');
     var sims=x&&x.sims||[],prs=(x&&x.prs||[]).filter(function(p){return p.state==='open'||p.state==='draft'}),subs=x?subRunning(x):[],srv=t.servers||0;
     var badges=(srv?'<span class="thb" data-tip="'+srv+' dev server'+(srv>1?'s':'')+' running">'+TIC.srv+srv+'</span>':'')+
@@ -2963,7 +3687,7 @@ function renderSlots(){
       '<div class="thtopic">'+esc(topic||(st==='free'?'free for the next task':'-'))+'</div>'+
       (t.memMB?'<div class="thmem" data-tip="'+gb(t.memMB)+' in use"><span style="width:'+Math.max(4,t.memMB/maxMem*100)+'%;background:'+colorFor(t.tree)+'"></span></div><div class="thmemv">'+gb(t.memMB)+'</div>':'')+
       (badges?'<div class="thbadges">'+badges+'</div>':'')+
-      '<div class="thacts">'+(open?'<button class="hact" data-convo="'+t.tree+'" data-tip="Open the conversation">'+TIC.chat+'</button>':'')+(x&&x.tty?'<button class="hact" data-focus="'+t.tree+'" data-tip="Open its iTerm tab">'+ICO.term+'</button>':'')+(t.stoppable?'<button class="hact danger" data-stoptree="'+t.tree+'" data-tip="Stop its dev servers, Metro, Jest and stray node processes. Never touches Claude or the files.">'+ICO.stop+'</button>':'')+(t.status==='in-use'||t.status==='orphan'?'<button class="hact danger" data-closetree="'+t.tree+'" data-tip="Close tree: stop everything, end its Claude session, close its tab, return the tree">'+ICO.close+'</button>':'')+'</div></div>'}).join('')+(spare?'<div class="th empty more" data-tip="'+spare+' more slot'+(spare>1?'s':'')+' under your limit of '+(S.pool.max||'?')+'; treehouse creates a tree in one when it is needed"><div class="thav"><span class="thnum">+'+spare+'</span></div><div class="thname">more slots</div><div class="thtopic muted">room under your limit</div></div>':'')+'</div>';
+      '<div class="thacts">'+(open?'<button class="hact" data-convo="'+t.tree+'" data-tip="Open the conversation">'+TIC.chat+'</button>':'')+(x&&x.tty?'<button class="hact" data-focus="'+t.tree+'" data-tip="Open its terminal">'+ICO.term+'</button>':'')+(t.stoppable?'<button class="hact danger" data-stoptree="'+t.tree+'" data-tip="Stop its dev servers, Metro, Jest and stray node processes. Never touches Claude or the files.">'+ICO.stop+'</button>':'')+(t.status==='in-use'||t.status==='orphan'?'<button class="hact danger" data-closetree="'+t.tree+'" data-tip="Close tree: stop everything, end its Claude session, close its tab, return the tree">'+ICO.close+'</button>':'')+'</div></div>'}).join('')+(spare?'<div class="th empty more" data-tip="'+spare+' more slot'+(spare>1?'s':'')+' under your limit of '+(S.pool.max||'?')+'; treehouse creates a tree in one when it is needed"><div class="thav"><span class="thnum">+'+spare+'</span></div><div class="thname">more slots</div><div class="thtopic muted">room under your limit</div></div>':'')+'</div>';
 }
 function renderPool(){
   renderSlots();
@@ -3141,10 +3865,10 @@ function renderJournal(){
     (j.running?'<span class="pill working">writing '+esc(j.running.date||'')+'…</span><button class="danger" id="journalCancel">Cancel</button>':(md.length?'<button id="journalFill" data-tip="'+esc(md.join(', '))+'">Fill '+md.length+' missing day'+(md.length>1?'s':'')+'</button>':'')+'<button class="primary" id="journalNow">Write today so far</button>')+'<label class="small"><input type="checkbox" id="journalAuto"'+(j.enabled?' checked':'')+'> every day at '+j.hour+':00</label>';
   $H('journal').html=j.entries.length?j.entries.map(function(e,i){return '<div class="panel journal-entry"><div class="ptitle"><b>'+esc(new Date(e.date+'T12:00:00').toLocaleDateString([],{weekday:'long',month:'long',day:'numeric'}))+'</b>'+(e.partial?'<span class="pill waiting">so far</span>':'')+'<span class="v"><span class="small muted">'+(e.trigger==='manual'?'written by hand':'written at 7am')+' · '+ago(e.at)+'</span> <button data-copyj="'+i+'">Copy</button> <button data-rewritej="'+esc(e.date)+'"'+(j.running?' disabled':'')+'>Rewrite</button> <button class="danger" data-deletej="'+esc(e.date)+'">Delete</button></span></div>'+(e.text?'<pre>'+esc(e.text.replace(/^\s*\d{1,2}\/\d{1,2}\s*\n/,''))+'</pre>':'<div class="small" style="color:var(--bad)">'+esc(e.error)+'</div>')+'</div>'}).join(''):'<div class="panel empty">No entries yet. They are written each day at '+j.hour+':00, or press "Write today so far".</div>';
 }
-var TITLES={tickets:'Tickets',prs:'PRs',overview:'Overview',resources:'Resources',trees:'Trees',processes:'Processes',captain:'Captain',cleanup:'Cleanup',settings:'Settings',proof:'Proof',journal:'Journal'};
+var TITLES={terms:'Terminals',tickets:'Tickets',prs:'PRs',overview:'Overview',resources:'Resources',trees:'Trees',processes:'Processes',captain:'Captain',cleanup:'Cleanup',settings:'Settings',proof:'Proof',journal:'Journal'};
 function placeAlert(){var a=$('alert'),home=$('alerthome'),dash=document.querySelector('#v-overview .dashcol');if(!a||!dash)return;if(view==='overview'){if(a.parentNode!==dash)dash.insertBefore(a,dash.firstChild)}else if(home&&a.parentNode!==home.parentNode)home.parentNode.insertBefore(a,home)}
-function setView(v){if(v==='sessions')v='trees';if(!TITLES[v])v='overview';view=v;setTimeout(placeAlert,0);document.body.classList.toggle('still',v==='overview'||v==='captain');window.scrollTo(0,0);setTimeout(sizeFeed,0);document.querySelectorAll('nav a').forEach(function(a){a.classList.toggle('on',a.dataset.v===v)});document.querySelectorAll('.view').forEach(function(s){s.classList.toggle('on',s.id==='v-'+v)});$('vtitle').textContent=TITLES[v];if(S&&!S.loading)render()}
-function render(){render0();syncGhosts()}
+function setView(v){if(v==='sessions')v='trees';if(!TITLES[v])v='overview';view=v;setTimeout(placeAlert,0);document.body.classList.toggle('still',v==='overview'||v==='captain'||v==='terms');if(v==='terms')setTimeout(function(){var t=curTerm();if(t){fitTerm(t);t.term.focus()}},0);window.scrollTo(0,0);setTimeout(sizeFeed,0);document.querySelectorAll('nav a').forEach(function(a){a.classList.toggle('on',a.dataset.v===v)});document.querySelectorAll('.view').forEach(function(s){s.classList.toggle('on',s.id==='v-'+v)});$('vtitle').textContent=TITLES[v];if(S&&!S.loading)render()}
+function render(){render0();syncGhosts();renderTermsBadge();if(view==='terms')renderTerms()}
 function render0(){
   var servers=S.servers.filter(function(x){return x.kind==='next'||x.kind==='metro'});
   $('sub').textContent='· '+new Date(S.at).toLocaleTimeString([],{hour:'numeric',minute:'2-digit',second:'2-digit'});$('sub').dataset.tip='Last updated';
@@ -3215,7 +3939,7 @@ document.addEventListener('click',function(e){
   if(b.dataset.movemenu){openMoveMenu(b);return}
   if(b.dataset.moveto){var mv=b.dataset.moveto.split('|');closePathMenu();moveTo(mv[0],mv[1]);return}
   if(b.dataset.archtoggle){ARCHOPEN=!ARCHOPEN;lsSet('treehouse-archopen',ARCHOPEN?'1':'');renderYourTurn();return}
-  if(b.dataset.focus){act({op:'focus',tree:b.dataset.focus}).then(function(r){if(!r.ok)toast(r.error)});return}
+  if(b.dataset.focus){focusTerm(b.dataset.focus);return}
   if(b.dataset.remote){if(!confirm('Send /remote-control to '+treeName(b.dataset.remote)+'? It turns on Remote Control so you can reach this session from claude.ai or the Claude app.'))return;act({op:'send',tree:b.dataset.remote,text:'/remote-control'}).then(function(r){toast(r.ok?'Sent /remote-control. Check that tab for the link.':r.error)});return}
   if(b.id==='journalNow'){act({op:'journal-now'}).then(function(){toast('Writing today so far; this takes a few minutes');setTimeout(loadJournal,800)});return}
   if(b.id==='journalFill'){act({op:'journal-fill'}).then(function(r){toast('Writing '+((r.days||[]).length)+' day(s), one at a time');setTimeout(loadJournal,800)});return}
@@ -3313,7 +4037,7 @@ var SHORTCUTS=[
   {keys:['⌘','⇧',']'],desc:'Next session card (or conversation)',match:function(e){return e.metaKey&&e.shiftKey&&e.code==='BracketRight'},run:function(){stepCard(1)}},
   // Outside a text box ⌘Z is always ours: Arc reopens the last closed tab on an unhandled ⌘Z.
   {keys:['⌘','Z'],desc:'Bring back the session you just replied to',match:function(e){var a=document.activeElement,typing=a&&(a.tagName==='TEXTAREA'||a.tagName==='INPUT')&&a.value;return e.metaKey&&!e.shiftKey&&(e.key==='z'||e.key==='Z')&&!typing},run:function(){if(!LAST_SENT||!S.sessions.some(function(q){return q.tree===LAST_SENT.tree})){toast('Nothing to bring back yet');return}var t=LAST_SENT.tree;location.hash='overview';openConvo(t);toast('Back to '+treeName(t))}},
-  {keys:['⌘','N'],desc:'Spin off a new task to a fresh tree (⌥N if the browser keeps ⌘N for itself)',match:function(e){if(e.code!=='KeyN'||e.ctrlKey||e.shiftKey||$('dlg').open)return false;return e.metaKey!==e.altKey},run:function(){if($('convo').open)$('convo').close();newTaskDialog()}},
+  {keys:['⌘','N'],desc:'New session: Claude in a fresh worktree, a checkout, Codex or a shell, on any host (⌥N if the browser keeps ⌘N for itself)',match:function(e){if(e.code!=='KeyN'||e.ctrlKey||e.shiftKey||$('dlg').open)return false;return e.metaKey!==e.altKey},run:function(){if($('convo').open)$('convo').close();newTaskDialog()}},
   {keys:['Enter'],desc:'Send a reply (Shift+Enter for a new line)'},
   {keys:['Esc'],desc:'Back from a subagent, close the conversation, or cancel a rename'},
   {keys:['A–Z'],desc:'Go to a tab: '+VIEWS.filter(function(v){return TABKEY[v]}).map(function(v){return TABKEY[v].toUpperCase()+' '+(TITLES[v]||v)}).join(' · '),match:function(e){var a=document.activeElement;if(e.metaKey||e.ctrlKey||e.altKey||e.shiftKey||e.repeat||!/^Key[A-Z]$/.test(e.code))return false;if(a&&(a.tagName==='TEXTAREA'||a.tagName==='INPUT'||a.isContentEditable))return false;if($('dlg').open||$('convo').open||$('cmdk').open)return false;var k=e.code.slice(3).toLowerCase();return VIEWS.some(function(v){return TABKEY[v]===k})},run:function(e){var k=e.code.slice(3).toLowerCase(),v=VIEWS.find(function(q){return TABKEY[q]===k});if(v)location.hash=v}},
@@ -3323,9 +4047,12 @@ var SHORTCUTS=[
 // The / command bar: every action as a row, filtered by what you type (all words must match).
 var CMDK={rows:[],sel:0};
 function cmdkCommands(){var out=[];
-  (S.sessions||[]).slice().sort(function(a,b){return treeOrder2(a.tree)-treeOrder2(b.tree)}).forEach(function(x){var topic=(x.tabNamed?x.title:humanize(x.title))||humanize(branchLabel(x.branch))||'',n=x.tree==='main'?'main':'tree '+x.tree;
+  out.push({label:'New session',sub:'Claude in a fresh worktree, a checkout, Codex or a shell',kind:'start',pri:3,run:function(){newSessionDialog()}});
+  (S.presets||[]).forEach(function(p){out.push({label:'Start '+(p.label||p.id),sub:presetTip(p),kind:'start',pri:3,run:function(){startPreset(p)}})});
+  (S.trees||[]).filter(function(t){return t.stale}).forEach(function(t){out.push({label:(t.tmuxSession?'Attach ':'Resume ')+treeName(t.tree),sub:branchLabel(t.branch)||'',kind:'left off',tree:t.tree,pri:3,run:function(){resumeTree(t.tree)}})});
+  (S.sessions||[]).slice().sort(function(a,b){return treeOrder2(a.tree)-treeOrder2(b.tree)}).forEach(function(x){var topic=(x.tabNamed?x.title:humanize(x.title))||humanize(branchLabel(x.branch))||'',n=treeName(x.tree);
     out.push({label:'Open '+n,sub:topic,kind:'detail view',tree:x.tree,pri:3,run:function(){openConvo(x.tree)}});
-    if(x.tty)out.push({label:'iTerm tab for '+n,sub:topic,kind:'terminal',tree:x.tree,pri:2,run:function(){act({op:'focus',tree:x.tree}).then(function(r){if(!r.ok)toast(r.error)})}});
+    if(x.tty)out.push({label:'Terminal for '+n,sub:topic,kind:'terminal',tree:x.tree,pri:2,run:function(){focusTerm(x.tree)}});
     out.push({label:(PINS[x.tree]?'Unpin ':'Pin ')+n,sub:topic,kind:'pin',tree:x.tree,pri:1,run:function(){togglePin(x.tree)}});
     ['fresh','parked','archive'].forEach(function(k){out.push({label:'Move '+n+' to '+SECNAME[k],sub:topic,kind:'move',tree:x.tree,pri:1,run:function(){moveTo(x.tree,k)}})});
     if(x.tree!=='main')out.push({label:'Close '+n,sub:topic,kind:'close tree',tree:x.tree,pri:1,run:function(){closeTreeDialog(x.tree)}})});
@@ -3336,7 +4063,7 @@ function cmdkCommands(){var out=[];
   out.push({label:'Theme: save the current look as a profile',sub:'Settings → Appearance',kind:'theme',pri:1,run:function(){location.hash='settings';setTimeout(function(){var i=$('profname');if(i){i.scrollIntoView({block:'center'});i.focus()}},150)}});
   out.push({label:'Lock pebtree',sub:S.lock&&S.lock.enabled?'Lock now; unlock with your passcode':'Set a passcode first (Settings → Lock)',kind:'⌥L',pri:2,run:function(){if(S.lock&&S.lock.enabled)act({op:'lock-now'});else location.hash='settings'}});
   return out}
-function treeOrder2(t){return t==='main'?-1:+t||999}
+function treeOrder2(t){var i=S&&S.sessions?S.sessions.findIndex(function(q){return q.tree===t}):-1;return i<0?999:i}
 function cmdkFilter(){var q=$('cmdkIn').value.trim().toLowerCase(),all=cmdkCommands(),words=q.split(/\s+/).filter(Boolean),num=/^\d+$/.test(q)?q:'';
   var rows=all.filter(function(c){var hay=(c.label+' '+c.sub+' '+c.kind).toLowerCase();return num?c.tree===num:words.every(function(w){return hay.indexOf(w)>=0})});
   rows.sort(function(a,b){var as=a.label.toLowerCase().indexOf(q)===0?1:0,bs=b.label.toLowerCase().indexOf(q)===0?1:0;return bs-as||b.pri-a.pri});
@@ -3421,7 +4148,7 @@ document.addEventListener('click',function(e){var b=e.target.closest&&e.target.c
 document.addEventListener('input',function(e){if(e.target.id==='prq'){PRF.q=e.target.value;lsSet('treehouse-prfilter',JSON.stringify(PRF));renderPRs()}});
 // The map above the feed: every tree as a chip in its section, so you see at a glance what is where.
 function feedMap(secs){var el=$('yt-map');if(!el)return;var h=secs.filter(function(s){return s[1].length}).map(function(s){return '<div class="fmrow"><span class="fml">'+s[0]+' <b>'+s[1].length+'</b></span><span class="fmchips">'+s[1].map(function(x){var st=sessState(x),topic=(x.tabNamed?x.title:humanize(x.title))||humanize(branchLabel(x.branch))||'';
-  return '<button class="fmchip '+st.cls+'" data-jump="'+x.tree+'" data-tip="'+esc(treeName(x.tree)+(topic?' · '+topic:'')+' · '+st.label)+'">'+treeIcon(x.tree,16)+'<span>'+(x.tree==='main'?'main':x.tree)+'</span>'+(isCaptain(x)?'<span class="capic sm">'+WHEEL+'</span>':'')+(x.menu?'<i class="fmq">?</i>':'')+'</button>'}).join('')+'</span></div>'}).join('');
+  return '<button class="fmchip '+st.cls+'" data-jump="'+x.tree+'" data-tip="'+esc(treeName(x.tree)+(topic?' · '+topic:'')+' · '+st.label)+'">'+treeIcon(x.tree,16)+'<span>'+esc(treeName(x.tree).replace(/ · .*$/,''))+'</span>'+(isCaptain(x)?'<span class="capic sm">'+WHEEL+'</span>':'')+(x.menu?'<i class="fmq">?</i>':'')+'</button>'}).join('')+'</span></div>'}).join('');
   if(el._h!==h&&!el.matches(':hover')){el._h=h;el.innerHTML=h}markMapCur()}
 // The chip of the tree you are on (its card has focus, or its detail view is open) gets a bold outline.
 function markMapCur(){var a=document.activeElement,p=a&&a.closest&&a.closest('#yourturn .post'),cur=p?p.dataset.tree:($('convo').open?CONVO:STEPCUR);document.querySelectorAll('#yt-map .fmchip').forEach(function(c){c.classList.toggle('cur',c.dataset.jump===cur)})}
@@ -3437,7 +4164,7 @@ function moveLater(t){var x=S.sessions.find(function(q){return q.tree===t});if(!
 document.addEventListener('input',function(e){if(!e.target.classList||!e.target.classList.contains('maxtrees')||!e.target.dataset.orig)return;var b=e.target.parentNode.querySelector('[data-savemax]');if(b)b.hidden=String(e.target.value)===e.target.dataset.orig});
 document.addEventListener('keydown',function(e){if(e.key==='Enter'&&e.target.classList&&e.target.classList.contains('maxtrees')){var b=e.target.parentNode.querySelector('[data-savemax]');if(b&&!b.hidden){e.preventDefault();b.click()}}});
 // Esc in a text box just leaves the box (what you typed stays). In the detail view it closes the view at once.
-document.addEventListener('keydown',function(e){if(e.key!=='Escape'||e.isComposing)return;var t=e.target;if(!t||!(t.tagName==='TEXTAREA'||t.tagName==='INPUT'))return;
+document.addEventListener('keydown',function(e){if(e.key!=='Escape'||e.isComposing)return;var t=e.target;if(!t||!(t.tagName==='TEXTAREA'||t.tagName==='INPUT'))return;if(t.closest&&t.closest('.xterm'))return;
   if(t.id==='cmdkIn'||(t.dataset&&t.dataset.renamebox)||(SLASH.ta===t&&SLASH.rows.length)||t.closest('#convo'))return; // in the detail view Esc closes it right away
   e.preventDefault();e.stopPropagation();t.blur()},true);
 // ---- Tickets tab: the project's engineering tickets. The list on the left, the one you picked on the right.
@@ -3495,8 +4222,8 @@ function closeTreeDialog(tree){if($('convo').open)$('convo').close();
     if(!p.ok){$('dlg').close();alertBox(p.error);return}
     var blocked=p.shared.length?'Its terminal tab ('+p.shared.join(', ')+') also hosts another tree&#39;s session, so closing it would take that one down too. Close the right tab by hand.':'';
     $('dlgBody').innerHTML='<div class="dlghead"><h3>Close '+treeName(tree)+'?</h3><button class="xbtn" id="dlgCancelX" data-tip="Cancel · Esc"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button></div>'+
-      '<ul class="closelist">'+(p.procs.filter(function(v){return v.kind!=='claude'}).length?'<li>Stops '+p.procs.filter(function(v){return v.kind!=='claude'}).map(function(v){return esc(v.label)}).join(', ')+'</li>':'')+'<li>Ends its Claude session and closes its iTerm tab'+(p.ttys.length?' ('+p.ttys.join(', ')+')':'')+'</li><li>Returns the worktree to the pool</li>'+
-      '<li>Branch <span class="mono">'+esc(p.branch)+'</span> is kept'+(p.ahead?', with its '+p.ahead+' commit'+(p.ahead>1?'s':'')+' not on master':'')+'</li></ul>'+
+      '<ul class="closelist">'+(p.procs.filter(function(v){return v.kind!=='claude'}).length?'<li>Stops '+p.procs.filter(function(v){return v.kind!=='claude'}).map(function(v){return esc(v.label)}).join(', ')+'</li>':'')+(p.procs.some(function(v){return v.kind==='claude'})||p.ttys.length?'<li>Ends its Claude session and its terminal'+(p.ttys.length?' ('+esc(p.ttys.join(', '))+')':'')+(p.local===false||p.hostLabel&&p.host!==(S.hosts.find(function(h){return h.local})||{}).id?' on '+esc(p.hostLabel):'')+'</li>':'')+(p.pool?'<li>Returns the worktree to the pool</li>':'')+
+      '<li>Branch <span class="mono">'+esc(p.branch)+'</span> is kept'+(p.ahead?', with its '+p.ahead+' commit'+(p.ahead>1?'s':'')+' not on the default branch':'')+'</li></ul>'+
       (p.hostsDashboardSession?'<p class="warnline">This is the tree the dashboard itself was started from.</p>':'')+
       (p.changes.length?'<div class="discardbox"><b>'+p.changes.length+' uncommitted change'+(p.changes.length>1?'s':'')+' will be lost:</b><div class="mono small">'+p.changes.slice(0,8).map(esc).join('<br>')+(p.changes.length>8?'<br>…':'')+'</div><label><input type="checkbox" id="discardOk"> Discard them</label></div>':'')+
       (blocked?'<p class="warnline">'+blocked+'</p>':'')+
@@ -3507,19 +4234,9 @@ function closeTreeDialog(tree){if($('convo').open)$('convo').close();
     $('dlgGo').onclick=function(){$('dlg').close();delete SENT[tree];CLOSING[tree]=Date.now();render();
       act({op:'close-tree',tree:tree,discard:!!(ok&&ok.checked)}).then(function(r){if(!r.ok){delete CLOSING[tree];render()}toast(r.ok?treeName(tree)+' closed'+(r.closedTab?' and its tab':'')+'. Branch '+r.branch+' kept.':'Not closed: '+r.error);refresh()},function(){delete CLOSING[tree];render();toast('Not closed: dashboard unreachable')})};
   })}
-function newTaskDialog(){
-  $('dlgBody').innerHTML='<div class="dlghead"><h3>Spin off a task</h3><button class="xbtn" id="dlgCancelX" data-tip="Cancel · Esc"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button></div>'+
-    '<p class="small muted" style="margin:0 0 10px">Takes a free tree, opens a new iTerm tab and starts Claude on it. It shows up in your feed when it needs you.</p>'+
-    '<input id="ntTitle" class="ntin" placeholder="Short name (optional), e.g. Fix pack price comma" maxlength="50">'+
-    '<textarea id="ntTask" class="ntin" rows="6" placeholder="What should it do? Include anything it needs to know: files, the bug, what done looks like."></textarea>'+
-    '<div class="row" style="justify-content:flex-end;margin-top:12px;gap:8px"><span class="small muted grow">⌘Enter to spin off</span><button id="dlgCancel">Cancel</button><button class="primary" id="dlgGo">Spin off</button></div>';
-  $('dlg').showModal();$('ntTask').focus();
-  $('dlgCancel').onclick=$('dlgCancelX').onclick=function(){$('dlg').close()};
-  function go(){var task=$('ntTask').value.trim();if(!task){$('ntTask').focus();return}var title=$('ntTitle').value.trim();$('dlg').close();toast('Finding a free tree…');
-    act({op:'spinoff',task:task,title:title}).then(function(r){toast(r.ok?'Spun off to '+treeName(r.tree)+' on '+r.branch:'Not spun off: '+r.error);refresh()})}
-  $('dlgGo').onclick=go;$('ntTask').onkeydown=function(e){if(e.key==='Enter'&&(e.metaKey||e.ctrlKey)){e.preventDefault();go()}}}
+function newTaskDialog(){newSessionDialog()}
 function showKeys(){$('dlgBody').innerHTML='<div class="dlghead"><h3>Keyboard shortcuts</h3><button class="xbtn" id="dlgCancel" data-tip="Close · Esc"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button></div><div class="keys">'+SHORTCUTS.map(function(k){return '<span>'+k.keys.map(function(x){return '<span class="kbd">'+esc(x)+'</span>'}).join(' ')+'</span><span>'+esc(k.desc)+'</span>'}).join('')+'</div>';$('dlg').showModal();$('dlgCancel').blur();$('dlgCancel').onclick=function(){$('dlg').close()}}
-document.addEventListener('keydown',function(e){for(var i=0;i<SHORTCUTS.length;i++){var k=SHORTCUTS[i];if(k.match&&k.match(e)){e.preventDefault();e.stopPropagation();k.run(e);return}}},true);
+document.addEventListener('keydown',function(e){var ae=document.activeElement;if(ae&&ae.closest&&ae.closest('.xterm')&&!e.metaKey)return;for(var i=0;i<SHORTCUTS.length;i++){var k=SHORTCUTS[i];if(k.match&&k.match(e)){e.preventDefault();e.stopPropagation();k.run(e);return}}},true);
 function sendReply(tree,ta){ta=ta||document.querySelector('textarea[data-reply="'+tree+'"]');var att=(ATTACH[tree]||[]).filter(function(a){return a.path});if(!ta||!ta.value.trim()&&!att.length)return;if((ATTACH[tree]||[]).some(function(a){return !a.path})){toast('Still uploading the image…');return}var typed=ta.value.trim(),text=typed+(att.length?(typed?'\n\n':'Here is an image.\n\n')+att.map(function(a){return 'Attached image: '+a.path}).join('\n'):''),inConvo=!!ta.closest('#convo');delete ATTACH[tree];paintAttach(tree);
   FORCE[tree]=1;
   LAST_SENT={tree:tree,at:Date.now()};try{sessionStorage.setItem('pebtree-lastsent',JSON.stringify(LAST_SENT))}catch(e){}var sx=S.sessions.find(function(q){return q.tree===tree});if(sx){var m=SENT[tree]||(SENT[tree]={key:sx.lastActive,prevSay:sx.lastSay,msgs:[]});m.at=Date.now();m.msgs.push({text:text,at:Date.now()})}
@@ -3679,4 +4396,97 @@ var RQ=0,CQ={};function soonRender(){if(RQ)return;RQ=setTimeout(function(){RQ=0;
     else if(ev.type==='session'&&S){var x=S.sessions.find(function(q){return q.tree===ev.tree});if(x){Object.assign(x,ev.fields);soonRender();if(CONVO===ev.tree&&$('convo').open)soonChat(ev.tree)}}};
   es.onopen=function(){FAILS=0;$('live').style.background='var(--ok)';$('liveText').textContent='live'}}
   open()})();
+
+/* ---------- terminals: tmux sessions on every host, attached in the page ---------- */
+// One xterm per open tab, each on its own WebSocket to pebtree, which runs tmux attach (over ssh for another host).
+// The session lives on in tmux whatever happens here: a dropped connection reattaches by itself.
+var TERM={tabs:[],cur:null,lib:null};
+function loadXterm(){if(TERM.lib)return TERM.lib;TERM.lib=new Promise(function(res,rej){var l=document.createElement('link');l.rel='stylesheet';l.href='/vendor/xterm.css';document.head.appendChild(l);
+  var s=document.createElement('script');s.src='/vendor/xterm.js';s.onerror=rej;s.onload=function(){var f=document.createElement('script');f.src='/vendor/xterm-fit.js';f.onload=res;f.onerror=rej;document.head.appendChild(f)};document.head.appendChild(s)});
+  TERM.lib.catch(function(){TERM.lib=null});return TERM.lib}
+function curTerm(){return TERM.tabs.find(function(t){return t.key===TERM.cur})}
+function termLabel(host,session){var x=(S.sessions||[]).find(function(q){return q.host===host&&q.tmuxSession===session});var h=(S.hosts||[]).find(function(q){return q.id===host});
+  return x?treeName(x.tree):session+(h&&!h.local?' · '+h.label:'')}
+function openTerm(host,session,label){if(location.hash!=='#terms')location.hash='terms';
+  loadXterm().then(function(){var k=host+'/'+session,t=TERM.tabs.find(function(x){return x.key===k});if(!t){t=newTerm(host,session,label||termLabel(host,session));TERM.tabs.push(t)}showTerm(k)},function(){toast('Could not load the terminal (xterm.js); see the pebtree log')})}
+function newTerm(host,session,label){var el=document.createElement('div');el.className='xt';$('termhost').appendChild(el);
+  var term=new Terminal({fontFamily:'ui-monospace,"SF Mono",Menlo,monospace',fontSize:13,cursorBlink:true,scrollback:5000,macOptionIsMeta:true,allowProposedApi:true,theme:{background:'#0b0e14',foreground:'#D8DEE9',cursor:'#88C0D0',selectionBackground:'rgba(136,192,208,.35)'}});
+  var fit=new FitAddon.FitAddon();term.loadAddon(fit);term.open(el);
+  var t={key:host+'/'+session,host:host,session:session,label:label,el:el,term:term,fit:fit,ws:null,alive:false,closed:false,retry:0,ended:false};
+  term.onData(function(d){if(t.ws&&t.ws.readyState===1)t.ws.send(JSON.stringify({i:d}));else if(t.ended&&d==='\r'){t.ended=false;connectTerm(t)}});
+  term.onResize(function(z){if(t.ws&&t.ws.readyState===1)t.ws.send(JSON.stringify({r:[z.cols,z.rows]}))});
+  connectTerm(t);return t}
+function fitTerm(t){try{t.fit.fit()}catch(e){}}
+function connectTerm(t){fitTerm(t);clearTimeout(t.rt);var exit=null;
+  var ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/api/term?t='+TOKEN+'&host='+encodeURIComponent(t.host)+'&session='+encodeURIComponent(t.session)+'&cols='+t.term.cols+'&rows='+t.term.rows);
+  ws.binaryType='arraybuffer';t.ws=ws;
+  ws.onopen=function(){t.alive=true;t.retry=0;paintTermTabs()};
+  ws.onmessage=function(m){if(typeof m.data==='string'){try{var j=JSON.parse(m.data);if(j.exit!==undefined)exit=j.exit}catch(e){}return}t.term.write(new Uint8Array(m.data))};
+  ws.onclose=function(){t.alive=false;t.ws=null;paintTermTabs();if(t.closed)return;
+    var h=(S.hosts||[]).find(function(q){return q.id===t.host}),gone=h&&h.up&&!h.terms.some(function(q){return q.session===t.session});
+    // tmux detached (Ctrl-b d, or the session ended): wait for you. A dropped connection (ssh gives 255): reattach by itself.
+    if(gone||exit===0){t.ended=true;t.term.write('\r\n\x1b[2m['+(gone?'session ended':'detached')+(gone?'':' · press Enter to reattach')+']\x1b[0m\r\n');return}
+    var wait=Math.min(15000,1000*Math.pow(2,t.retry++));t.term.write('\r\n\x1b[2m[connection lost · reattaching in '+Math.round(wait/1000)+'s]\x1b[0m\r\n');t.rt=setTimeout(function(){if(!t.closed)connectTerm(t)},wait)}}
+function showTerm(k){TERM.cur=k;TERM.tabs.forEach(function(t){t.el.classList.toggle('on',t.key===k)});paintTermTabs();renderTerms();var t=curTerm();if(t)setTimeout(function(){fitTerm(t);t.term.focus()},0)}
+function closeTermTab(k){var t=TERM.tabs.find(function(x){return x.key===k});if(!t)return;t.closed=true;clearTimeout(t.rt);try{t.ws&&t.ws.close()}catch(e){}t.term.dispose();t.el.remove();TERM.tabs=TERM.tabs.filter(function(x){return x!==t});
+  if(TERM.cur===k)TERM.cur=TERM.tabs.length?TERM.tabs[TERM.tabs.length-1].key:null;showTerm(TERM.cur)}
+function paintTermTabs(){var el=$('termtabs');if(!el)return;el.innerHTML=TERM.tabs.map(function(t){return '<div class="termtab'+(t.key===TERM.cur?' on':'')+'" data-termtab="'+esc(t.key)+'"><span class="tsdot '+(t.alive?'ok':'bad')+'"></span>'+esc(t.label)+'<button class="xbtn" data-closetab="'+esc(t.key)+'" data-tip="Close this tab · the session keeps running">×</button></div>'}).join('');$('termempty').hidden=TERM.tabs.length>0}
+function focusTerm(tree){var x=(S.sessions||[]).find(function(q){return q.tree===tree});if(x&&x.term==='tmux'){if($('convo').open)$('convo').close();openTerm(x.host,x.tmuxSession,treeName(tree));return}
+  act({op:'focus',tree:tree}).then(function(r){if(!r.ok)toast(r.error)})}
+function cleanT(t){t=String(t||'').replace(/^[✳⠀-⣿◐-◓]\s*/,'');return /^[\w.-]+$/.test(t)&&(S.hosts||[]).some(function(h){return h.label===t})?'':t}
+function presetTip(p){var h=(S.hosts||[]).find(function(q){return q.id===p.host})||{};return ({tree:'Claude in a fresh worktree of ',claude:'Claude in ',codex:'Codex in ',shell:p.cmd?p.cmd+' in ':'a shell in '})[p.kind]+(p.repo||'~')+' on '+(h.label||p.host)}
+function startPreset(p){toast(p.kind==='tree'?'Leasing a worktree on '+p.host+'…':'Starting '+(p.label||p.id)+'…');
+  act({op:'spawn',host:p.host,kind:p.kind,repo:p.repo,session:p.session,cmd:p.cmd,prompt:p.prompt||''}).then(function(r){if(!r.ok){toast('Not started: '+r.error);return}openTerm(r.host,r.session);refresh()})}
+function resumeTree(tree){toast('Picking '+treeName(tree)+' back up…');act({op:'resume-tree',tree:tree}).then(function(r){if(!r.ok){toast('Could not resume: '+r.error);return}openTerm(r.host,r.session,treeName(tree));refresh()})}
+function renderTermsBadge(){var n=(S.trees||[]).filter(function(t){return t.stale}).length,off=(S.hosts||[]).filter(function(h){return !h.up}).length,el=$('c-terms');if(!el)return;
+  el.textContent=off?'!':n?String(n):'';el.classList.toggle('turn',!!(n||off));el.dataset.tip=off?'A host is unreachable':n?n+' tree'+(n>1?'s':'')+' you hold with nothing running in '+(n>1?'them':'it'):''}
+function renderTerms(){if(!$('termside'))return;var stale=(S.trees||[]).filter(function(t){return t.stale});
+  var h='<div><button class="primary" data-newsess="1" style="width:100%">New session</button></div>';
+  if((S.presets||[]).length)h+='<div><div class="tshead">Quick start</div><div class="tspresets">'+S.presets.map(function(p,i){return '<button data-preset="'+i+'" data-tip="'+esc(presetTip(p))+'">'+esc(p.label||p.id)+'</button>'}).join('')+'</div></div>';
+  if(stale.length)h+='<div><div class="tshead">Where you left off</div>'+stale.map(function(t){var last=t.last||{};return '<div class="tsstale">'+treeIcon(t.tree,22)+'<div class="grow"><b>'+esc(treeName(t.tree))+'</b><div class="small muted">'+esc(branchLabel(t.branch)||'no branch')+(t.dirty?' · '+t.dirty+' changed':'')+(last.at?' · '+ago(last.at):'')+'</div>'+(last.say||last.you?'<div class="small muted tsclip" title="'+esc(plain(last.say||last.you).slice(-600))+'">'+esc(plain(last.say||last.you).slice(-180))+'</div>':'')+
+    '<div class="row" style="gap:6px;margin-top:6px"><button data-resume="'+esc(t.tree)+'" data-tip="'+(t.tmuxSession?'Its tmux session is still there: open it':'Start Claude --continue in it')+'">'+(t.tmuxSession?'Attach':'Resume')+'</button><button class="danger" data-closetree="'+esc(t.tree)+'" data-tip="Hand the worktree back to the pool">Return</button></div></div></div>'}).join('')+'</div>';
+  (S.hosts||[]).forEach(function(ho){var mine=(S.sessions||[]).filter(function(x){return x.host===ho.id});
+    h+='<div><div class="tshead"><span class="tsdot '+(ho.up?'ok':'bad')+'"></span>'+esc(ho.label)+(ho.up?'':'<span style="text-transform:none;letter-spacing:0;color:var(--bad)">· '+esc(ho.error||'offline')+', retrying</span>')+'</div>';
+    var rows=ho.terms.map(function(q){var k=ho.id+'/'+q.session,x=mine.find(function(s){return s.tmuxSession===q.session}),st=x?(x.menu||x.claudeState==='waiting'?'claude':x.claudeState==='working'?'work':''):q.attached?'ok':'';
+      return '<div class="tsterm'+(TERM.cur===k?' on':'')+'" data-term="'+esc(ho.id)+'|'+esc(q.session)+'"><span class="tsdot '+st+'"></span><div class="grow"><b>'+esc(x?treeName(x.tree).replace(' · '+ho.label,''):q.session)+'</b><div class="small muted tsclip">'+esc(x?(x.title||q.session):(cleanT(q.title)||q.cmd))+(q.windows>1?' · '+q.windows+' windows':'')+' · '+ago(q.activity)+'</div></div><button class="xbtn" data-killterm="'+esc(ho.id)+'|'+esc(q.session)+'" data-tip="End this tmux session">×</button></div>'});
+    // sessions still in iTerm tabs on this Mac: one click brings their tab forward
+    mine.filter(function(x){return x.term==='iterm'}).forEach(function(x){rows.push('<div class="tsterm" data-focus="'+esc(x.tree)+'"><span class="tsdot '+(x.menu||x.claudeState==='waiting'?'claude':x.claudeState==='working'?'work':'')+'"></span><div class="grow"><b>'+esc(treeName(x.tree))+'</b><div class="small muted tsclip">'+esc(x.title||'')+' · iTerm tab</div></div></div>')});
+    h+=(rows.length?rows.join(''):'<div class="small muted">Nothing running.</div>')+'</div>'});
+  $H('termside').html=h}
+document.addEventListener('click',function(e){var b=e.target.closest&&e.target.closest('[data-newsess],[data-preset],[data-resume],[data-killterm],[data-closetab],[data-termtab],[data-term],.tsterm[data-focus]');if(!b)return;
+  if(b.dataset.newsess){newSessionDialog();return}
+  if(b.dataset.preset){startPreset(S.presets[+b.dataset.preset]);return}
+  if(b.dataset.resume){resumeTree(b.dataset.resume);return}
+  if(b.dataset.killterm){e.stopPropagation();var kv=b.dataset.killterm.split('|');if(!confirm('End tmux session '+kv[1]+'? Whatever runs in it stops'+(/^tw-/.test(kv[1])?', and its worktree goes back to the pool (kept if it has changes)':'')+'.'))return;
+    act({op:'kill-term',host:kv[0],session:kv[1]}).then(function(r){toast(r.ok?'Ended '+kv[1]:r.error);if(r.ok)closeTermTab(kv[0]+'/'+kv[1]);refresh()});return}
+  if(b.dataset.closetab){e.stopPropagation();closeTermTab(b.dataset.closetab);return}
+  if(b.dataset.termtab){showTerm(b.dataset.termtab);return}
+  if(b.dataset.term){var tv=b.dataset.term.split('|');openTerm(tv[0],tv[1]);return}
+  if(b.dataset.focus){focusTerm(b.dataset.focus)}});
+// refit whenever the pane changes size (window, sidebar, the page first laying out)
+if(window.ResizeObserver)new ResizeObserver(function(){var t=curTerm();if(t&&view==='terms')fitTerm(t)}).observe($('termhost'));else window.addEventListener('resize',function(){var t=curTerm();if(t&&view==='terms')fitTerm(t)});
+// New session: where (host), what (Claude in a fresh worktree or a checkout, Codex, a shell), which repo, and an optional first prompt.
+function newSessionDialog(){var H=(S.hosts||[]).filter(function(h){return h.up});if(!H.length){toast('No host is reachable right now');return}
+  var st={host:lsGet('treehouse-newhost')||H[0].id,kind:lsGet('treehouse-newkind')||'tree'};if(!H.some(function(h){return h.id===st.host}))st.host=H[0].id;
+  var KINDS=[['tree','Claude · new worktree'],['claude','Claude · checkout'],['codex','Codex'],['shell','Shell']];
+  $('dlgBody').innerHTML='<div class="dlghead"><h3>New session</h3><button class="xbtn" id="dlgCancelX" data-tip="Cancel · Esc"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button></div>'+
+    '<div class="nsgrid"><label>Where</label><div class="seg mini" id="nsHost"></div><label>What</label><div class="seg mini" id="nsKind"></div><label>In</label><select id="nsRepo" class="ntin" style="margin:0"></select>'+
+    '<label>Name</label><input id="nsTitle" class="ntin" style="margin:0" placeholder="Optional, e.g. Fix pack price comma" maxlength="50"><label style="align-self:start;padding-top:8px">First prompt</label><textarea id="nsPrompt" class="ntin" style="margin:0" rows="5" placeholder="Optional. What should it do? Files, the bug, what done looks like."></textarea></div>'+
+    '<p class="small muted" id="nsNote" style="margin:10px 0 0"></p><div class="row" style="justify-content:flex-end;margin-top:12px;gap:8px"><span class="small muted grow">⌘Enter to start</span><button id="dlgCancel">Cancel</button><button class="primary" id="dlgGo">Start</button></div>';
+  function paint(){var h=H.find(function(x){return x.id===st.host});
+    $('nsHost').innerHTML=H.map(function(x){return '<button data-nshost="'+esc(x.id)+'" class="'+(x.id===st.host?'on':'')+'">'+esc(x.label)+'</button>'}).join('');
+    $('nsKind').innerHTML=KINDS.map(function(k){return '<button data-nskind="'+k[0]+'" class="'+(k[0]===st.kind?'on':'')+'">'+k[1]+'</button>'}).join('');
+    var want=lsGet('treehouse-newrepo-'+st.host)||'',repos=(h.repos||[]).slice();
+    if(st.kind==='tree')repos.sort(function(a,b){return (b.pool-a.pool)||(b.at-a.at)});
+    $('nsRepo').innerHTML=repos.map(function(r){return '<option value="'+esc(r.path)+'"'+(r.path===want?' selected':'')+'>'+esc(r.name)+(r.pool?'  · has worktrees':'')+'</option>'}).join('')+(st.kind==='tree'?'':'<option value="~"'+(want==='~'?' selected':'')+'>~ (home)</option>');
+    $('nsPrompt').disabled=$('nsTitle').disabled=st.kind==='shell';
+    $('nsNote').textContent=st.kind==='tree'?'Leases a free worktree from treehouse; it goes back to the pool when Claude exits or you end the session (kept while it has changes).':st.kind==='shell'?'A login shell in a new tmux session.':'Runs in a new tmux session on '+h.label+'; it survives disconnects.';
+    segVars&&document.querySelectorAll('#dlgBody .seg').forEach(segVars)}
+  paint();$('dlg').showModal();
+  $('dlgBody').onclick=function(e){var b=e.target.closest('[data-nshost],[data-nskind]');if(!b)return;if(b.dataset.nshost)st.host=b.dataset.nshost;if(b.dataset.nskind)st.kind=b.dataset.nskind;paint()};
+  $('dlgCancel').onclick=$('dlgCancelX').onclick=function(){$('dlg').close()};
+  function go(){var repo=$('nsRepo').value;if(!repo){toast('No checkout to start in on that host');return}lsSet('treehouse-newhost',st.host);lsSet('treehouse-newkind',st.kind);lsSet('treehouse-newrepo-'+st.host,repo);$('dlg').close();
+    toast(st.kind==='tree'?'Leasing a worktree…':'Starting…');
+    act({op:'spawn',host:st.host,kind:st.kind,repo:repo,title:$('nsTitle').value.trim(),prompt:st.kind==='shell'?'':$('nsPrompt').value}).then(function(r){if(!r.ok){toast('Not started: '+r.error);return}openTerm(r.host,r.session);refresh()})}
+  $('dlgGo').onclick=go;$('nsPrompt').onkeydown=function(e){if(e.key==='Enter'&&(e.metaKey||e.ctrlKey)){e.preventDefault();go()}};setTimeout(function(){$('nsPrompt').disabled?$('dlgGo').focus():$('nsPrompt').focus()},0)}
 </script></body></html>`;
