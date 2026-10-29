@@ -4316,7 +4316,7 @@ document.addEventListener('pointerdown',function(e){var cf=e.target.closest&&e.t
   function finish(save){if(!drag)return;drag.classList.remove('dragging');drag.removeAttribute('draggable');document.body.classList.remove('cardrag');setTgt('');if(mark&&mark.parentNode)mark.parentNode.removeChild(mark);mark=null;
     if(save){ORDER=[].slice.call($('yt-list').querySelectorAll('.post')).map(function(p){return p.dataset.tree});lsSet('treehouse-cardorder',JSON.stringify(ORDER))}drag=null;from='';render()}})();
 // Copy on select, like Claude Code in the terminal. Not in text boxes (selecting there is for editing), and not the double-click that opens a card.
-document.addEventListener('mouseup',function(e){if(e.button!==0||e.target.closest('textarea,input,[contenteditable]')||e.detail===2&&e.target.closest('.post'))return;setTimeout(function(){var t=String(window.getSelection()||'').trim();if(!t||!navigator.clipboard)return;navigator.clipboard.writeText(t).then(function(){toast('Copied '+(t.length>40?t.length+' characters':'"'+t+'"'))},function(){})},0)});
+document.addEventListener('mouseup',function(e){if(e.button!==0||e.target.closest('textarea,input,[contenteditable]')||e.detail===2&&e.target.closest('.post'))return;var xt=e.target.closest('.xterm')&&curTerm();setTimeout(function(){var t=(xt?xt.term.getSelection():String(window.getSelection()||'')).trim();if(!t||!navigator.clipboard)return;navigator.clipboard.writeText(t).then(function(){toast('Copied '+(t.length>40?t.length+' characters':'"'+t+'"'))},function(){})},0)});
 // The detail view's side panel: drag its left edge; the width is remembered, double-click resets it.
 document.addEventListener('pointerdown',function(e){var sp=e.target.closest&&e.target.closest('#cvsplit');if(!sp||e.button!==0)return;e.preventDefault();var main=sp.parentNode,r=main.getBoundingClientRect(),w=0;sp.classList.add('drag');document.body.classList.add('splitting');sp.setPointerCapture(e.pointerId);
   function mv(ev){w=Math.round(Math.max(260,Math.min(r.width*0.65,r.right-ev.clientX)));main.style.setProperty('--sidew',w+'px')}
@@ -4441,8 +4441,12 @@ function termLabel(host,session){var x=(S.sessions||[]).find(function(q){return 
 function openTerm(host,session,label){if(location.hash!=='#terms')location.hash='terms';
   loadXterm().then(function(){var k=host+'/'+session,t=TERM.tabs.find(function(x){return x.key===k});if(!t){t=newTerm(host,session,label||termLabel(host,session));TERM.tabs.push(t)}showTerm(k)},function(){toast('Could not load the terminal (xterm.js); see the pebtree log')})}
 function newTerm(host,session,label){var el=document.createElement('div');el.className='xt';$('termhost').appendChild(el);
-  var term=new Terminal({fontFamily:'ui-monospace,"SF Mono",Menlo,monospace',fontSize:13,cursorBlink:true,scrollback:5000,macOptionIsMeta:true,allowProposedApi:true,theme:{background:'#0a0a0a',foreground:'#f5f5f5',cursor:'#f5f5f5',selectionBackground:'rgba(255,255,255,.2)'}});
+  var term=new Terminal({fontFamily:'ui-monospace,"SF Mono",Menlo,monospace',fontSize:13,cursorBlink:true,scrollback:5000,macOptionIsMeta:true,macOptionClickForcesSelection:true,allowProposedApi:true,theme:{background:'#0a0a0a',foreground:'#f5f5f5',cursor:'#f5f5f5',selectionBackground:'rgba(255,255,255,.2)'}});
   var fit=new FitAddon.FitAddon();term.loadAddon(fit);term.open(el);
+  // tmux (set-clipboard on/external) hands what you copy in it to the terminal as OSC 52: put it on this Mac's clipboard
+  term.parser.registerOscHandler(52,function(d){var b=d.slice(d.indexOf(';')+1);if(!b||b==='?'||!navigator.clipboard)return true;
+    try{var s=atob(b),u=new Uint8Array(s.length);for(var i=0;i<s.length;i++)u[i]=s.charCodeAt(i);var tx=new TextDecoder().decode(u)}catch(e){return true}
+    navigator.clipboard.writeText(tx).then(function(){toast('Copied '+(tx.length>40?tx.length+' characters':'"'+tx.trim()+'"'))},function(){toast('Copy failed: click into the page and copy again')});return true});
   var t={key:host+'/'+session,host:host,session:session,label:label,el:el,term:term,fit:fit,ws:null,alive:false,closed:false,retry:0,ended:false};
   term.onData(function(d){if(t.ws&&t.ws.readyState===1)t.ws.send(JSON.stringify({i:d}));else if(t.ended&&d==='\r'){t.ended=false;connectTerm(t)}});
   term.onResize(function(z){if(t.ws&&t.ws.readyState===1)t.ws.send(JSON.stringify({r:[z.cols,z.rows]}))});
