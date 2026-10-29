@@ -4447,6 +4447,14 @@ function newTerm(host,session,label){var el=document.createElement('div');el.cla
   term.parser.registerOscHandler(52,function(d){var b=d.slice(d.indexOf(';')+1);if(!b||b==='?'||!navigator.clipboard)return true;
     try{var s=atob(b),u=new Uint8Array(s.length);for(var i=0;i<s.length;i++)u[i]=s.charCodeAt(i);var tx=new TextDecoder().decode(u)}catch(e){return true}
     navigator.clipboard.writeText(tx).then(function(){toast('Copied '+(tx.length>40?tx.length+' characters':'"'+tx.trim()+'"'))},function(){toast('Copy failed: click into the page and copy again')});return true});
+  // With tmux's mouse on, xterm.js reports one wheel step per wheel event however far it went, so a trackpad flick
+  // scrolls a line. Report one step per line scrolled instead, like a native terminal (SGR, which tmux always asks for).
+  var wpart=0;term.attachCustomWheelEventHandler(function(e){var ms=term._core&&term._core.coreMouseService,sc=el.querySelector('.xterm-screen');
+    if(term.modes.mouseTrackingMode==='none'||!ms||ms.activeEncoding!=='SGR'||!sc||!e.deltaY||e.shiftKey)return true;
+    var r=sc.getBoundingClientRect(),rh=r.height/term.rows;wpart+=e.deltaMode===1?e.deltaY:e.deltaMode===2?e.deltaY*term.rows:e.deltaY/rh;
+    var n=Math.trunc(wpart);wpart-=n;n=Math.max(-term.rows,Math.min(term.rows,n));if(!n||!t.ws||t.ws.readyState!==1)return false;
+    var col=Math.max(1,Math.min(term.cols,Math.floor((e.clientX-r.left)/(r.width/term.cols))+1)),row=Math.max(1,Math.min(term.rows,Math.floor((e.clientY-r.top)/rh)+1));
+    t.ws.send(JSON.stringify({i:('\x1b[<'+((n<0?64:65)+(e.altKey?8:0)+(e.ctrlKey?16:0))+';'+col+';'+row+'M').repeat(Math.abs(n))}));return false});
   var t={key:host+'/'+session,host:host,session:session,label:label,el:el,term:term,fit:fit,ws:null,alive:false,closed:false,retry:0,ended:false};
   term.onData(function(d){if(t.ws&&t.ws.readyState===1)t.ws.send(JSON.stringify({i:d}));else if(t.ended&&d==='\r'){t.ended=false;connectTerm(t)}});
   term.onResize(function(z){if(t.ws&&t.ws.readyState===1)t.ws.send(JSON.stringify({r:[z.cols,z.rows]}))});
