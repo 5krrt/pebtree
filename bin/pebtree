@@ -3140,7 +3140,7 @@ body.collapsed nav .brand{flex-direction:column;gap:10px}body.collapsed nav .bra
 .tsterm b,.tsstale b{font-size:12.5px;font-weight:600}
 .tsstale{cursor:default;align-items:flex-start;background:var(--panel2);margin-bottom:6px}
 .tsstale button{padding:3px 8px;font-size:12px}
-.tsclip{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:190px}
+.tsclip{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:190px}.tsterm b.tsclip{display:block}.termtab .tsclip{max-width:220px}
 .tsstale .tsclip{white-space:normal;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
 .grow{flex:1;min-width:0}
 .tsdot{width:8px;height:8px;border-radius:50%;background:var(--other);flex:none}
@@ -4443,8 +4443,11 @@ function loadXterm(){if(TERM.lib)return TERM.lib;TERM.lib=new Promise(function(r
   var s=document.createElement('script');s.src='/vendor/xterm.js';s.onerror=rej;s.onload=function(){var f=document.createElement('script');f.src='/vendor/xterm-fit.js';f.onload=res;f.onerror=rej;document.head.appendChild(f)};document.head.appendChild(s)});
   TERM.lib.catch(function(){TERM.lib=null});return TERM.lib}
 function curTerm(){return TERM.tabs.find(function(t){return t.key===TERM.cur})}
-function termLabel(host,session){var x=(S.sessions||[]).find(function(q){return q.host===host&&q.tmuxSession===session});var h=(S.hosts||[]).find(function(q){return q.id===host});
-  return x?treeName(x.tree):session+(h&&!h.local?' · '+h.label:'')}
+// what a worktree's session is about: the name you gave its tab, else its terminal title, else its branch
+function termTopic(x){return (x.tabNamed?x.title:humanize(x.title))||humanize(branchLabel(x.branch))}
+function termSess(host,session){return (S.sessions||[]).find(function(q){return q.host===host&&q.tmuxSession===session})}
+function termLabel(host,session){var x=termSess(host,session),h=(S.hosts||[]).find(function(q){return q.id===host});
+  return x?termTopic(x)||treeName(x.tree):session+(h&&!h.local?' · '+h.label:'')}
 function openTerm(host,session,label){if(location.hash!=='#terms')location.hash='terms';
   loadXterm().then(function(){var k=host+'/'+session,t=TERM.tabs.find(function(x){return x.key===k});if(!t){t=newTerm(host,session,label||termLabel(host,session));TERM.tabs.push(t)}showTerm(k)},function(){toast('Could not load the terminal (xterm.js); see the pebtree log')})}
 function newTerm(host,session,label){var el=document.createElement('div');el.className='xt';$('termhost').appendChild(el);
@@ -4481,7 +4484,8 @@ function connectTerm(t){fitTerm(t);clearTimeout(t.rt);var exit=null;
 function showTerm(k){TERM.cur=k;TERM.tabs.forEach(function(t){t.el.classList.toggle('on',t.key===k)});paintTermTabs();renderTerms();var t=curTerm();if(t)setTimeout(function(){fitTerm(t);t.term.focus()},0)}
 function closeTermTab(k){var t=TERM.tabs.find(function(x){return x.key===k});if(!t)return;t.closed=true;clearTimeout(t.rt);try{t.ws&&t.ws.close()}catch(e){}t.term.dispose();t.el.remove();TERM.tabs=TERM.tabs.filter(function(x){return x!==t});
   if(TERM.cur===k)TERM.cur=TERM.tabs.length?TERM.tabs[TERM.tabs.length-1].key:null;showTerm(TERM.cur)}
-function paintTermTabs(){var el=$('termtabs');if(!el)return;el.innerHTML=TERM.tabs.map(function(t){return '<div class="termtab'+(t.key===TERM.cur?' on':'')+'" data-termtab="'+esc(t.key)+'"><span class="tsdot '+(t.alive?'ok':'bad')+'"></span>'+esc(t.label)+'<button class="xbtn" data-closetab="'+esc(t.key)+'" data-tip="Close this tab · the session keeps running">×</button></div>'}).join('');$('termempty').hidden=TERM.tabs.length>0}
+// a tab of a Claude session follows its topic as it changes; repainted only when something did
+function paintTermTabs(){var el=$('termtabs');if(!el)return;var h=TERM.tabs.map(function(t){var lb=termSess(t.host,t.session)?termLabel(t.host,t.session):t.label;return '<div class="termtab'+(t.key===TERM.cur?' on':'')+'" data-termtab="'+esc(t.key)+'"><span class="tsdot '+(t.alive?'ok':'bad')+'"></span><span class="tsclip" title="'+esc(lb)+'">'+esc(lb)+'</span><button class="xbtn" data-closetab="'+esc(t.key)+'" data-tip="Close this tab · the session keeps running">×</button></div>'}).join('');if(el._h!==h){el._h=h;el.innerHTML=h}$('termempty').hidden=TERM.tabs.length>0}
 function focusTerm(tree){var x=(S.sessions||[]).find(function(q){return q.tree===tree});if(x&&x.term==='tmux'){if($('convo').open)$('convo').close();openTerm(x.host,x.tmuxSession,treeName(tree));return}
   act({op:'focus',tree:tree}).then(function(r){if(!r.ok)toast(r.error)})}
 function cleanT(t){t=String(t||'').replace(/^[✳⠀-⣿◐-◓]\s*/,'');return /^[\w.-]+$/.test(t)&&(S.hosts||[]).some(function(h){return h.label===t})?'':t}
@@ -4499,11 +4503,11 @@ function renderTerms(){if(!$('termside'))return;var stale=(S.trees||[]).filter(f
   (S.hosts||[]).forEach(function(ho){var mine=(S.sessions||[]).filter(function(x){return x.host===ho.id});
     h+='<div><div class="tshead"><span class="tsdot '+(ho.up?'ok':'bad')+'"></span>'+esc(ho.label)+(ho.up?'':'<span style="text-transform:none;letter-spacing:0;color:var(--bad)">· '+esc(ho.error||'offline')+', retrying</span>')+'</div>';
     var rows=ho.terms.map(function(q){var k=ho.id+'/'+q.session,x=mine.find(function(s){return s.tmuxSession===q.session}),st=x?(x.menu||x.claudeState==='waiting'?'claude':x.claudeState==='working'?'work':''):q.attached?'ok':'';
-      return '<div class="tsterm'+(TERM.cur===k?' on':'')+'" data-term="'+esc(ho.id)+'|'+esc(q.session)+'"><span class="tsdot '+st+'"></span><div class="grow"><b>'+esc(x?treeName(x.tree).replace(' · '+ho.label,''):q.session)+'</b><div class="small muted tsclip">'+esc(x?(x.title||q.session):(cleanT(q.title)||q.cmd))+(q.windows>1?' · '+q.windows+' windows':'')+' · '+ago(q.activity)+'</div></div><button class="xbtn" data-killterm="'+esc(ho.id)+'|'+esc(q.session)+'" data-tip="End this tmux session">×</button></div>'});
+      return '<div class="tsterm'+(TERM.cur===k?' on':'')+'" data-term="'+esc(ho.id)+'|'+esc(q.session)+'"><span class="tsdot '+st+'"></span><div class="grow">'+(x?'<b class="tsclip" title="'+esc(termTopic(x)||'')+'">'+esc(termTopic(x)||treeName(x.tree).replace(' · '+ho.label,''))+'</b>':'<b>'+esc(q.session)+'</b>')+'<div class="small muted tsclip">'+esc(x?treeName(x.tree).replace(' · '+ho.label,''):(cleanT(q.title)||q.cmd))+(q.windows>1?' · '+q.windows+' windows':'')+' · '+ago(q.activity)+'</div></div><button class="xbtn" data-killterm="'+esc(ho.id)+'|'+esc(q.session)+'" data-tip="End this tmux session">×</button></div>'});
     // sessions still in iTerm tabs on this Mac: one click brings their tab forward
-    mine.filter(function(x){return x.term==='iterm'}).forEach(function(x){rows.push('<div class="tsterm" data-focus="'+esc(x.tree)+'"><span class="tsdot '+(x.menu||x.claudeState==='waiting'?'claude':x.claudeState==='working'?'work':'')+'"></span><div class="grow"><b>'+esc(treeName(x.tree))+'</b><div class="small muted tsclip">'+esc(x.title||'')+' · iTerm tab</div></div></div>')});
+    mine.filter(function(x){return x.term==='iterm'}).forEach(function(x){rows.push('<div class="tsterm" data-focus="'+esc(x.tree)+'"><span class="tsdot '+(x.menu||x.claudeState==='waiting'?'claude':x.claudeState==='working'?'work':'')+'"></span><div class="grow"><b class="tsclip" title="'+esc(termTopic(x)||'')+'">'+esc(termTopic(x)||treeName(x.tree))+'</b><div class="small muted tsclip">'+esc(treeName(x.tree))+' · iTerm tab</div></div></div>')});
     h+=(rows.length?rows.join(''):'<div class="small muted">Nothing running.</div>')+'</div>'});
-  $H('termside').html=h}
+  $H('termside').html=h;paintTermTabs()}
 document.addEventListener('click',function(e){var b=e.target.closest&&e.target.closest('[data-newsess],[data-preset],[data-resume],[data-killterm],[data-closetab],[data-termtab],[data-term],.tsterm[data-focus]');if(!b)return;
   if(b.dataset.newsess){newSessionDialog();return}
   if(b.dataset.preset){startPreset(S.presets[+b.dataset.preset]);return}
