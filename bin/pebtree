@@ -663,13 +663,15 @@ function deleteDropsAt({ path: p, id }) {
 }
 // Git checkouts a new session can start in: the folders right under each root (worktrees, whose .git is a file,
 // are left out), most recently used first; `pool` when treehouse already has a pool of worktrees for it.
+// Folders macOS guards with a privacy prompt are skipped: looking inside one asks you to allow node, every scan.
+const MAC_GUARDED = new Set(['Desktop', 'Documents', 'Downloads', 'Library', 'Movies', 'Music', 'Pictures', 'Public']);
 function listRepos(roots) {
   const out = new Map(), pooled = new Set(readPools().map((w) => w.repo));
   const dflt = process.platform === 'darwin' ? ['~', '~/Developer', '~/src', '~/code', '~/projects'] : ['~/workspace', '~'];
   for (const r of (Array.isArray(roots) && roots.length ? roots : dflt).map(tilde)) {
     let ents = []; try { ents = fs.readdirSync(r, { withFileTypes: true }); } catch { continue; }
     for (const e of ents) {
-      if (!e.isDirectory() || e.name.startsWith('.')) continue;
+      if (!e.isDirectory() || e.name.startsWith('.') || (process.platform === 'darwin' && r === HOME && MAC_GUARDED.has(e.name))) continue;
       const p = path.join(r, e.name), g = path.join(p, '.git');
       let st; try { st = fs.statSync(g); } catch { continue; }
       if (!st.isDirectory()) continue;
