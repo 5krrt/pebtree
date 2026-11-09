@@ -3349,9 +3349,16 @@ document.addEventListener('contextmenu',function(e){var f=e.target.closest&&e.ta
   var g=PMENU.getBoundingClientRect();if(Math.abs(g.left-x)>4||Math.abs(g.top-y)>4){PMENU.style.left=(2*x-g.left)+'px';PMENU.style.top=(2*y-g.top)+'px'}},true);
 document.addEventListener('keydown',function(e){if(e.key==='Escape'&&PMENU){e.preventDefault();e.stopPropagation();closePathMenu()}},true);
 addEventListener('scroll',closePathMenu,true);
+// a url without the punctuation, closing quote or unmatched paren that ends the sentence around it
+function trimUrl(u){var m;while((m=u.match(/(&gt;|&quot;|&#39;|[.,;:!?'"*\]])$/))||/\)$/.test(u)&&u.split('(').length<u.split(')').length)u=u.slice(0,u.length-(m?m[0].length:1));return u}
 function md(t){
   var out=[],list=null,code=null,table=null,lang='';
-  function inline(x){return esc(x).replace(/\x60([^\x60]+)\x60/g,'<code>$1</code>').replace(/\*\*([^*]+)\*\*/g,'<b>$1</b>').replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g,'<a href="$2" target="_blank">$1</a>').replace(/(^|\s)(https?:\/\/[^\s<]+)/g,'$1<a href="$2" target="_blank">$2</a>')}
+  // links wherever Claude puts them: [text](url), <url>, a code span that is just a url, or bare in parens or bold
+  function inline(x){var keep=[];function stash(h){keep.push(h);return '\x00'+(keep.length-1)+'\x00'}function a(u,t){return '<a href="'+u+'" target="_blank">'+t+'</a>'}
+    x=esc(x).replace(/\x60([^\x60]+)\x60/g,function(m,c){return stash(/^https?:\/\/\S+$/.test(c)?a(c,'<code>'+c+'</code>'):'<code>'+c+'</code>')}).replace(/\*\*([^*]+)\*\*/g,'<b>$1</b>')
+      .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g,function(m,t,u){return stash(a(u,t))}).replace(/&lt;(https?:\/\/[^\s&]+)&gt;/g,function(m,u){return stash(a(u,u))})
+      .replace(/https?:\/\/[^\s<>\x00]+/g,function(m){var u=trimUrl(m);return a(u,u)+m.slice(u.length)});
+    return x.replace(/\x00(\d+)\x00/g,function(m,i){return keep[+i]})}
   function cells(l){return l.trim().replace(/^\|/,'').replace(/\|$/,'').split('|').map(function(c){return c.trim()})}
   function closeTable(){if(table){out.push('<div class="mdtable"><table><thead><tr>'+table[0].map(function(c){return '<th>'+inline(c)+'</th>'}).join('')+'</tr></thead><tbody>'+table.slice(1).map(function(r){return '<tr>'+r.map(function(c){return '<td>'+inline(c)+'</td>'}).join('')+'</tr>'}).join('')+'</tbody></table></div>');table=null}}
   function close(){if(list){out.push('</'+list+'>');list=null}closeTable()}
@@ -4453,8 +4460,10 @@ function termLabel(host,session){var x=termSess(host,session),h=(S.hosts||[]).fi
 function openTerm(host,session,label){if(location.hash!=='#terms')location.hash='terms';
   loadXterm().then(function(){var k=host+'/'+session,t=TERM.tabs.find(function(x){return x.key===k});if(!t){t=newTerm(host,session,label||termLabel(host,session));TERM.tabs.push(t)}showTerm(k)},function(){toast('Could not load the terminal (xterm.js); see the pebtree log')})}
 function newTerm(host,session,label){var el=document.createElement('div');el.className='xt';$('termhost').appendChild(el);
-  var term=new Terminal({fontFamily:'ui-monospace,"SF Mono",Menlo,monospace',fontSize:13,cursorBlink:true,scrollback:5000,macOptionIsMeta:true,macOptionClickForcesSelection:true,allowProposedApi:true,theme:{background:'#0a0a0a',foreground:'#f5f5f5',cursor:'#f5f5f5',selectionBackground:'rgba(255,255,255,.2)'}});
+  var term=new Terminal({fontFamily:'ui-monospace,"SF Mono",Menlo,monospace',fontSize:13,cursorBlink:true,scrollback:5000,macOptionIsMeta:true,macOptionClickForcesSelection:true,allowProposedApi:true,linkHandler:{activate:function(e,u){if(/^https?:\/\//i.test(u))window.open(u,'_blank','noopener,noreferrer')}},theme:{background:'#0a0a0a',foreground:'#f5f5f5',cursor:'#f5f5f5',selectionBackground:'rgba(255,255,255,.2)'}});
   var fit=new FitAddon.FitAddon();term.loadAddon(fit);term.open(el);
+  // tmux hands Claude's links over as plain text (OSC 8 links only pass with its hyperlinks feature): click opens them
+  term.registerLinkProvider({provideLinks:function(y,cb){cb(termUrls(term,y))}});
   // tmux (set-clipboard on/external) hands what you copy in it to the terminal as OSC 52: put it on this Mac's clipboard
   term.parser.registerOscHandler(52,function(d){var b=d.slice(d.indexOf(';')+1);if(!b||b==='?'||!navigator.clipboard)return true;
     try{var s=atob(b),u=new Uint8Array(s.length);for(var i=0;i<s.length;i++)u[i]=s.charCodeAt(i);var tx=new TextDecoder().decode(u)}catch(e){return true}
@@ -4471,6 +4480,27 @@ function newTerm(host,session,label){var el=document.createElement('div');el.cla
   term.onData(function(d){if(t.ws&&t.ws.readyState===1)t.ws.send(JSON.stringify({i:d}));else if(t.ended&&d==='\r'){t.ended=false;connectTerm(t)}});
   term.onResize(function(z){if(t.ws&&t.ws.readyState===1)t.ws.send(JSON.stringify({r:[z.cols,z.rows]}))});
   connectTerm(t);return t}
+// The urls on buffer row y (1-based), each one link across all its rows. A long url spills onto the next row either
+// as a soft wrap, or, from Claude Code, hard-broken: cut at the width it printed at (so its row is the widest around,
+// whatever the width is now) and carried on in the row below.
+function termUrls(term,y){var b=term.buffer.active,cols=term.cols,UC=/[\w\-.~:\/?#\[\]@!$&()*+,;=%]/,lens={};
+  function row(i){var l=b.getLine(i);return l?l.translateToString(false).padEnd(cols).slice(0,cols):null}
+  function len(i){if(!(i in lens)){var r=row(i);lens[i]=r==null||/[─│╭╮╰╯]/.test(r)?0:r.replace(/ +$/,'').length}return lens[i]}
+  function widest(i){var n=len(i);if(n<20)return false;for(var k=i-12;k<=i+12;k++)if(k!==i&&len(k)>n)return false;return true}
+  // 0: row i+1 starts a new line; 1: it is a soft wrap of row i; 2: it carries on a url hard-broken at the end of row i
+  function joins(i,d){var n=b.getLine(i+1);if(!n||i<0)return 0;if(n.isWrapped)return 1;var r=row(i).replace(/ +$/,''),nx=row(i+1).replace(/^ +/,'');
+    if(!r||!UC.test(r.slice(-1))||!nx||!UC.test(nx.charAt(0))||/^https?:/.test(nx)||!widest(i))return 0;
+    // and only if what follows reads as more url (not "And then…" after a url that happened to end there)
+    var tok=nx.match(/^\S+/)[0];if(!/[\/?=&%#_~\d-]/.test(trimUrl(tok))&&nx.slice(tok.length).trim())return 0;
+    return /https?:\/\/\S*$/.test(r)||(d<8&&/^ *\S+$/.test(r)&&joins(i-1,d+1)===2)?2:0}
+  var top=y-1,end=y-1,n=0;while(top>0&&n++<20&&joins(top-1,0))top--;n=0;while(n++<20&&joins(end,0))end++;
+  // the line's text, and where on screen each of its characters is
+  var text='',at=[];for(var i=top;i<=end;i++){var r=row(i),x0=i>top&&joins(i-1,0)===2?r.length-r.replace(/^ +/,'').length:0,x1=i<end&&joins(i,0)===2?len(i)||r.replace(/ +$/,'').length:cols;
+    for(var x=x0;x<x1;x++){text+=r.charAt(x);at.push({x:x+1,y:i+1})}}
+  var re=/https?:\/\/[^\s<>"'\x60]+/g,m,out=[];
+  while((m=re.exec(text))){var u=trimUrl(m[0]),s=at[m.index],e=at[m.index+u.length-1];if(e.y<y||s.y>y)continue;
+    out.push({range:{start:s,end:e},text:u,activate:function(ev,t){window.open(t,'_blank','noopener,noreferrer')}})}
+  return out}
 function fitTerm(t){try{t.fit.fit()}catch(e){}}
 function connectTerm(t){fitTerm(t);clearTimeout(t.rt);var exit=null;
   var ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/api/term?t='+TOKEN+'&host='+encodeURIComponent(t.host)+'&session='+encodeURIComponent(t.session)+'&cols='+t.term.cols+'&rows='+t.term.rows);
